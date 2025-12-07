@@ -5,11 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "strands-agents[litellm]>=1.0.0",
+    "bedrock-agentcore>=0.1.1",
+    "bedrock-agentcore-starter-toolkit>=0.1.2",
+    "boto3>=1.39.9",
+    "strands-agents>=1.0.1",
     "strands-agents-tools>=0.2.1",
-    "uv>=0.7.21",
-    "boto3>=1.39.7",
-    "bedrock-agentcore-starter-toolkit>=0.1.0",
     "fastapi>=0.115.0",
     "uvicorn>=0.32.0",
     "pyjwt>=2.9.0",
