@@ -1,6 +1,6 @@
 # Design Guidelines
 
-This document specifies what we will create: the concrete deliverables, structures, and checklists for examples under `experiment/`. For the rationale, principles, and workflow (why and how), see `principle.md`.
+This document specifies what we will create: the concrete deliverables, structures, and checklists for examples under root directory. For the rationale, principles, and workflow (why and how), see `principle.md`.
 
 ## Scope of This Document
 - What to deliver (files, structure, configs)
@@ -10,7 +10,7 @@ This document specifies what we will create: the concrete deliverables, structur
 
 ## Directory Structure
 
-Each example should be self-contained within its own directory under `experiment`:
+Each example should be self-contained within its own directory:
 
 ```
 example_name/
@@ -24,7 +24,7 @@ example_name/
 └── example_name/      # Core implementation (deployable if needed for AgentCore)
 ```
 
-All dependencies should be integrated to `experiment/pyproject.toml`.
+All dependencies should be integrated to `pyproject.toml`.
 
 ## Entry Point Requirements
 
