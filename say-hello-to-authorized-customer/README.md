@@ -45,18 +45,92 @@ This example demonstrates how to build an agent that greets users with personali
      4. Save changes
    - `config.json` is generated for keeping IDs of all created resources (for cleanup)
 
-5. Run the demonstration:
+5. Create a Cognito user (first time only):
    ```bash
-   # First time: Sign up
-   uv run python main.py --username myuser --password MyPass123! --signup
-   
-   # Subsequent runs: Login
-   uv run python main.py --username myuser --password MyPass123!
+   uv run python main.py --signup --username myuser --password MyPass123!
    ```
+
+6. Run the demonstration:
+   ```bash
+   uv run python main.py
+   ```
+   - Server starts on http://localhost:9090
+   - Open browser and click "Login with Cognito"
+   - Enter your username and password in Cognito Hosted UI
+   - Authorize YouTube access when prompted
+   - See personalized greeting with your YouTube data
 
 ## Demonstration Flow
 
 This diagram shows the **runtime behavior** when a user interacts with the agent (what you'll see when running `main.py`):
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Browser
+    participant Server as OAuth2 Server<br/>(localhost:9090)
+    participant Cognito as Cognito Hosted UI
+    participant Gateway as AgentCore Gateway
+    participant Identity as AgentCore Identity
+    participant YouTube as YouTube API
+
+    Note over User,Cognito: Inbound Authentication (Cognito Authorization Code Flow)
+    User->>Browser: Open http://localhost:9090
+    Browser->>Server: GET /
+    Server-->>Browser: Show "Login with Cognito" button
+    Browser->>Cognito: Click login → Authorization Code flow
+    Note over Cognito: User enters username/password
+    Cognito-->>Browser: Redirect with auth code
+    Browser->>Server: GET /cognito/callback?code=XXX
+    Server->>Cognito: Exchange code for access token
+    Note over Server: Access token contains custom scope:<br/>youtube-gateway-resources/youtube-target
+    Cognito-->>Server: Access token (with custom scope)
+    
+    Note over Server,Gateway: First Request (No Outbound OAuth Token)
+    Server->>Gateway: Call YouTube tool with access token + _meta
+    Gateway->>Gateway: Validate access token scope
+    Gateway->>Identity: Check user's YouTube OAuth token
+    Identity-->>Gateway: No YouTube token found
+    Gateway-->>Server: Return OAuth elicitation URL
+    Server-->>Browser: Display "Authorize YouTube" message
+    
+    Note over Browser,Identity: Outbound OAuth Authorization (YouTube)
+    Browser->>YouTube: User clicks elicitation URL
+    Note over YouTube: User authorizes YouTube access
+    YouTube->>Identity: Redirect with authorization code
+    Identity->>Server: Redirect to /oauth2/callback?session_id=X&bearer_token=Y
+    Server->>Identity: complete_resource_token_auth(session_id, bearer_token)
+    Note over Identity: Exchange code for YouTube token<br/>Store token bound to user (via sub claim)
+    Identity-->>Server: YouTube token stored
+    
+    Note over Server,YouTube: Second Request (Outbound OAuth Authorized)
+    Server->>Gateway: Retry YouTube tool call with access token
+    Gateway->>Identity: Get user's YouTube OAuth token
+    Identity-->>Gateway: Return YouTube access token
+    Gateway->>YouTube: GET /channels (with OAuth token)
+    YouTube-->>Gateway: Channel data
+    Gateway-->>Server: Channel response
+    Server-->>Browser: Display greeting with YouTube data
+```
+
+**Runtime Components**:
+- **Cognito Hosted UI**: Web-based login for user authentication (Authorization Code flow)
+- **OAuth2 Server (localhost:9090)**: Handles both Cognito and YouTube OAuth callbacks
+  - `/`: Home page with "Login with Cognito" button
+  - `/cognito/callback`: Exchanges Cognito auth code for access token with custom scope
+  - `/oauth2/callback`: Completes YouTube OAuth and retries Gateway call
+- **Identity (AgentCore Identity)**: 
+  - **Inbound role**: Validates Cognito access tokens
+  - **Outbound role**: Stores YouTube OAuth tokens per user (bound via `sub` claim)
+- **Gateway**: Proxies YouTube API calls with OAuth authentication
+  - **First request**: Validates custom scope, returns OAuth elicitation URL
+  - **Second request**: Uses stored YouTube token to call API
+
+**Key Insight**: Two separate OAuth flows:
+1. **Cognito Authorization Code flow** (Inbound): Gets access token with custom scope `youtube-gateway-resources/youtube-target`
+2. **YouTube OAuth flow** (Outbound): Gets YouTube access token for API calls
+
+**Why custom scope?** Gateway requires this scope in the JWT when using OAuth credential providers for outbound authentication.
 
 ```mermaid
 sequenceDiagram
@@ -215,63 +289,105 @@ sequenceDiagram
 
 ### 1. Agent (`say_hello_to_authorized_customer/agent.py`)
 
-**Purpose**: Core agent logic that orchestrates the greeting flow with user authentication context.
+**Purpose**: Core agent logic that makes raw JSON-RPC calls to Gateway with OAuth configuration.
 
 #### Demonstration
 **Runtime behavior** (see Demonstration Flow diagram):
 
 **Key Functions**:
-- `create_agent(gateway_url: str, region: str) -> Agent`: Creates agent with Gateway MCP tools
-  - Connects to Gateway URL from `config.json`
-  - Loads YouTube API tools (get_channel, get_subscriptions)
-- `greet_user(agent: Agent, bearer_token: str) -> str`: Executes greeting flow
-  - Passes bearer_token for user identification
-  - Detects elicitation responses (contains session_id and bearer_token in callback URL)
-  - Displays OAuth consent URL when needed
-  - Retries tool call after authorization
-  - Formats greeting: "Hello [Channel Name]! You subscribe to [Subscription] that has fantastic videos!"
+- `call_gateway_tool(gateway_url, bearer_token, tool_name, arguments, return_url, force_auth)`: Makes raw JSON-RPC call
+  - Uses MCP protocol version `2025-11-25` (required for OAuth elicitation)
+  - Includes `_meta` parameter with OAuth configuration
+  - Returns JSON-RPC response
+- `greet_user(gateway_url, bearer_token, return_url)`: Executes greeting flow
+  - Calls YouTube API via Gateway
+  - Detects OAuth elicitation (error code -32001)
+  - Extracts authorization URL from error response
+  - Returns greeting or "OAuth authorization pending"
 
 **Implementation**:
-- Elicitation detection: Check tool response for `session_id` and `bearer_token` parameters
-- Error handling: Gracefully handle missing channel or subscription data
-- Bearer token propagation: Pass bearer_token to all Gateway tool calls
+```python
+def call_gateway_tool(gateway_url, bearer_token, tool_name, arguments, return_url, force_auth=False):
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {bearer_token}",
+        "MCP-Protocol-Version": "2025-11-25"  # Required for OAuth elicitation
+    }
+    
+    _meta = {
+        "aws.bedrock-agentcore.gateway/credentialProviderConfiguration": {
+            "oauthCredentialProvider": {
+                "returnUrl": return_url,
+                "forceAuthentication": force_auth
+            }
+        }
+    }
+    
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": arguments,
+            "_meta": _meta
+        }
+    }
+    
+    response = requests.post(gateway_url, headers=headers, json=payload)
+    return response.json()
+```
+
+**Why raw JSON-RPC?** Strands MCP client uses protocol version `2025-03-26` which doesn't support OAuth URL elicitation. Version `2025-11-25` is required.
+
+**OAuth Elicitation Detection**:
+```python
+if "error" in result and result["error"].get("code") == -32001:
+    auth_url = result["error"]["data"]["authorizationUrl"]
+    # Display URL to user
+```
 
 ### 2. OAuth2 Callback Server (`oauth2_callback_server.py`)
 
-**Purpose**: Verifies user identity and completes OAuth session binding with AgentCore Identity.
+**Purpose**: Web server handling both Cognito and YouTube OAuth flows.
 
-**Design Note**: Stateless approach where bearer_token is passed via query parameter (differs from reference implementation that stores tokens in memory).
+**Design Note**: Stateful server that maintains access token between Cognito authentication and YouTube OAuth completion.
 
 #### Demonstration
-**Runtime behavior** (see "Outbound OAuth Authorization" in Demonstration Flow diagram):
+**Runtime behavior** (see Demonstration Flow diagram):
 
 **Key Functions**:
-- `get_oauth2_callback_base_url() -> str`: Returns `http://localhost:9090/oauth2/callback`
-- `OAuth2CallbackServer.__init__(region: str)`: Initializes stateless FastAPI server
-  - Creates Identity client for completing OAuth flows
-  - No state storage - fully stateless
-- `OAuth2CallbackServer._handle_oauth2_callback(session_id: str, bearer_token: str)`: Completes OAuth session
-  - Receives: `session_id` (OAuth session) and `bearer_token` (user identity)
-  - Calls: `identity_client.complete_resource_token_auth(session_id, bearer_token)`
-  - Result: AgentCore Identity exchanges authorization code and stores YouTube token
+- `OAuth2CallbackServer.__init__(region, config)`: Initializes FastAPI server
+  - Stores region and config (gateway_url, user_pool_id, etc.)
+  - Creates Identity client for completing YouTube OAuth
+  - Maintains access token in memory
+- `_handle_cognito_callback(code)`: Handles Cognito Authorization Code callback
+  - Exchanges auth code for access token with custom scope
+  - Stores access token in `self.access_token`
+  - Calls Gateway to trigger YouTube OAuth elicitation
+  - Displays authorization URL to user
+- `_handle_youtube_callback(session_id, bearer_token)`: Completes YouTube OAuth
+  - Calls `identity_client.complete_resource_token_auth()`
+  - Retries Gateway call with stored access token
+  - Displays greeting with YouTube data
 
 **Endpoints**:
-- `GET /ping`: Health check
-- `GET /oauth2/callback?session_id=<id>&bearer_token=<jwt>`: OAuth callback handler
+- `GET /`: Home page with "Login with Cognito" button
+- `GET /cognito/callback?code=XXX`: Cognito Authorization Code callback
+- `GET /oauth2/callback?session_id=X&bearer_token=Y`: YouTube OAuth callback
 
 **Configuration**:
 - Port: 9090 (configurable via constant)
-- Localhost only (does not support SageMaker Workshop Studio)
+- Localhost only
 
 **Implementation**:
-- Stateless: No server-side state or memory storage
-- Bearer_token: Passed via query parameter (use HTTPS in production)
-- Multi-user: Supports concurrent OAuth flows without coordination
+- Stateful: Stores access token between OAuth flows
+- Multi-user: Each browser session maintains separate state
 - Error handling: Returns HTTP 500 with error details on failure
 
 ### 3. Cognito (Inbound Auth)
 
-**Purpose**: External identity provider that authenticates users accessing the agent.
+**Purpose**: External identity provider that authenticates users accessing the agent via Authorization Code flow.
 
 #### Construction
 **How to build** (see Construction Flow diagram Step 2):
@@ -294,27 +410,54 @@ user_pool_response = cognito_client.create_user_pool(
         }
     }
 )
-
 user_pool_id = user_pool_response["UserPool"]["Id"]
 
-# Step 2: Create user pool client
+# Step 2: Create domain for Authorization Code flow
+domain_prefix = f"youtube-gw-{user_pool_id.lower().replace('_', '-')[:20]}"
+cognito_client.create_user_pool_domain(
+    Domain=domain_prefix,
+    UserPoolId=user_pool_id
+)
+
+# Step 3: Create resource server with custom scope
+resource_server_id = "youtube-gateway-resources"
+cognito_client.create_resource_server(
+    UserPoolId=user_pool_id,
+    Identifier=resource_server_id,
+    Name="YouTube Gateway Resources",
+    Scopes=[{
+        "ScopeName": "youtube-target",
+        "ScopeDescription": "Access to YouTube Gateway target"
+    }]
+)
+
+# Step 4: Create app client for Authorization Code flow
 client_response = cognito_client.create_user_pool_client(
     UserPoolId=user_pool_id,
     ClientName="youtube-agent-client",
-    ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]
+    GenerateSecret=False,
+    AllowedOAuthFlows=["code"],
+    AllowedOAuthFlowsUserPoolClient=True,
+    AllowedOAuthScopes=[f"{resource_server_id}/youtube-target"],
+    CallbackURLs=["http://localhost:9090/cognito/callback"],
+    SupportedIdentityProviders=["COGNITO"]
 )
-
 cognito_client_id = client_response["UserPoolClient"]["ClientId"]
 
-# Step 3: Get discovery URL for JWT validation
-region = user_pool_response["UserPool"]["Arn"].split(":")[3]
-cognito_discovery_url = f"https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/jwks.json"
+# Step 5: Get discovery URL for JWT validation
+cognito_discovery_url = f"https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/openid-configuration"
 ```
 
 **Output**:
 - `user_pool_id`: Cognito user pool identifier (saved to config.json)
 - `cognito_client_id`: Used in Gateway authorizer configuration
 - `cognito_discovery_url`: Used in Gateway authorizer configuration
+- `domain_prefix`: Used to construct Cognito Hosted UI URL
+
+**Why Authorization Code flow?** 
+- `USER_PASSWORD_AUTH` cannot include custom resource server scopes
+- Authorization Code flow via Hosted UI supports custom scopes
+- Custom scope `youtube-gateway-resources/youtube-target` required by Gateway
 
 **Note**: Users are created via `main.py --signup`, not during construction.
 
@@ -344,14 +487,15 @@ cognito_client.admin_set_user_password(
 )
 ```
 
-**User authentication flow**:
-1. User provides username/password via CLI arguments
-2. Identity client authenticates with Cognito
-3. Cognito validates credentials and returns JWT
-4. Identity wraps Cognito JWT into AgentCore JWT (bearer_token)
-5. User uses bearer_token for all subsequent requests
-
-**Note**: The authentication is handled by `IdentityClient.authenticate()` which internally communicates with Cognito.
+**User authentication flow** (Authorization Code):
+1. User opens http://localhost:9090 in browser
+2. Clicks "Login with Cognito" button
+3. Redirected to Cognito Hosted UI: `https://{domain_prefix}.auth.{region}.amazoncognito.com/oauth2/authorize`
+4. User enters username/password
+5. Cognito redirects to callback: `http://localhost:9090/cognito/callback?code=XXX`
+6. Server exchanges code for access token with custom scope
+7. Access token contains `youtube-gateway-resources/youtube-target` scope
+8. Server uses access token for all Gateway requests
 
 ### 4. Gateway
 
@@ -525,33 +669,46 @@ Identity has **two roles**:
 
 **Role 1: Inbound Authentication** (top of diagram)
 - User → Identity → Cognito flow (Cognito created in §3)
-- Issues AgentCore JWT (bearer_token) to user
-- Bearer token identifies user in all subsequent requests
+- Gateway validates Cognito AccessToken (not IdToken)
+- AccessToken contains `sub` claim that identifies user in all subsequent requests
 
-**How to get JWT (bearer_token)**:
+**How to get AccessToken for Gateway**:
 ```python
-from bedrock_agentcore.services.identity import IdentityClient
+import boto3
 
-identity_client = IdentityClient(region=region)
+cognito_client = boto3.client("cognito-idp", region_name=region)
 
 # Authenticate with Cognito credentials
-bearer_token = identity_client.authenticate(
-    identity_arn=identity_arn,  # From config.json (created in Construction)
-    username=username,
-    password=password
+response = cognito_client.initiate_auth(
+    ClientId=cognito_client_id,  # From config.json
+    AuthFlow="USER_PASSWORD_AUTH",
+    AuthParameters={
+        "USERNAME": username,
+        "PASSWORD": password
+    }
 )
+
+# Use AccessToken for Gateway authentication (contains 'sub' claim for user identification)
+access_token = response["AuthenticationResult"]["AccessToken"]
 ```
+
+**Important**: Gateway requires **AccessToken**, not IdToken:
+- **AccessToken**: Used for authorization (accessing Gateway resources)
+- **IdToken**: Used for identification (who the user is)
+- Both contain the same `sub` claim for user identification
+- OAuth token binding uses the `sub` claim from AccessToken
 
 **Role 2: Outbound OAuth Token Storage** (middle of diagram)
 - Stores YouTube OAuth tokens per user
-- Binds tokens to users via JWT `sub` claim from bearer_token
-- Called by OAuth2Server: `complete_resource_token_auth(session_id, bearer_token)`
+- Binds tokens to users via JWT `sub` claim from access_token
+- Called by OAuth2Server: `complete_resource_token_auth(session_id, access_token)`
 - Retrieved by Gateway when proxying YouTube requests
 
 **How to complete OAuth flow**:
 ```python
 # Called by OAuth2 callback server after user authorizes
-identity_client.complete_resource_token_auth(session_id, bearer_token)
+# access_token passed via query parameter contains 'sub' claim for user binding
+identity_client.complete_resource_token_auth(session_id, access_token)
 ```
 
 ### 6. Construction Entry Point (`construct.py`)
@@ -604,7 +761,7 @@ uv run python construct.py --cleanup
 
 ### 7. Demonstration Entry Point (`main.py`)
 
-**Purpose**: Demonstrates the complete OAuth flow using pre-built components.
+**Purpose**: Starts OAuth2 callback server for web-based authentication flow.
 
 #### Demonstration
 **Runtime behavior** (see Demonstration Flow diagram):
@@ -612,45 +769,44 @@ uv run python construct.py --cleanup
 **Prerequisites**:
 - `construct.py` must be run first
 - `config.json` must exist
-- OAuth2 callback server must be accessible
 
 **Command-line Arguments**:
 ```bash
-uv run python main.py --username <username> --password <password> [--signup]
+uv run python main.py [--signup --username <username> --password <password>]
 ```
-- `--username`: Cognito username
-- `--password`: Cognito password
-- `--signup`: Optional flag to create new user (signup mode)
+- `--signup`: Optional flag to create new user (requires --username and --password)
+- `--username`: Cognito username (for signup only)
+- `--password`: Cognito password (for signup only)
 
 **Flow**:
 1. Load configuration from `config.json`
-2. **Authentication/Registration**:
-   - If `--signup` flag: Create new user in Cognito (from `user_pool_id` in config.json)
-   - Authenticate user with Cognito (get bearer_token via IdentityClient)
-3. Start OAuth2 callback server
-4. Create agent with Gateway URL
-5. Execute greeting flow (handles OAuth elicitation)
-6. Display personalized greeting
+2. **Optional Signup**: If `--signup` flag provided, create user in Cognito
+3. Start OAuth2 callback server on port 9090
+4. Display URL: http://localhost:9090
+5. Server handles:
+   - Cognito Authorization Code flow
+   - YouTube OAuth flow
+   - Gateway tool calls
+   - Greeting display
 
-**YouTube API Call Parameters**:
-- Channels: `part=snippet`, `mine=true`
-  - Used field: `items[0].snippet.title` (channel name)
-- Subscriptions: `part=snippet`, `mine=true`, `maxResults=3` (recommended for greeting)
-  - Used field: `items[0].snippet.title` (subscribed channel name)
-
-**Greeting Format**: "Hello [Channel Name]! You subscribe to [Subscription] that has fantastic videos!"
+**User Interaction**:
+1. Open http://localhost:9090 in browser
+2. Click "Login with Cognito"
+3. Enter username/password in Cognito Hosted UI
+4. Authorize YouTube when prompted
+5. See personalized greeting
 
 **Security Note**:
-- Username/password passed as CLI arguments (not through agent context)
-- Credentials used only for authentication, never logged or stored
-- Bearer_token used for all subsequent operations
+- Username/password only used for signup (admin operation)
+- Authentication happens via browser (Cognito Hosted UI)
+- Access token obtained via Authorization Code flow with custom scope
+- No credentials passed through agent context
 
 **Error Handling**:
 - Validates config.json exists
-- Handles OAuth flow interruptions
-- Provides clear error messages
-- Graceful handling of elicitation responses
-- User already exists error (in signup mode)
+- Handles user already exists error (in signup mode)
+- Server provides clear error messages in browser
+- Graceful handling of OAuth flow interruptions
 
 ### 8. Configuration Template (`.env.example`)
 
