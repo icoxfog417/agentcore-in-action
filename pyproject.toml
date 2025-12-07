@@ -10,9 +10,14 @@ dependencies = [
     "uv>=0.7.21",
     "boto3>=1.39.7",
     "bedrock-agentcore-starter-toolkit>=0.1.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "pyjwt>=2.9.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [dependency-groups]
 dev = [
     "ruff>=0.14.8",
+    "pytest>=8.3.0",
 ]
