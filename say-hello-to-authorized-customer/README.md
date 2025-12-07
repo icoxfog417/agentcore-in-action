@@ -2,13 +2,13 @@
 
 ## Overview
 
-This example demonstrates how to build an agent that greets users with their Google account profile name using AgentCore Identity and AgentCore Gateway with OAuth 2.0 Authorization Code Grant (3-legged OAuth). The agent securely accesses Google's People API on behalf of authenticated users to retrieve their profile information.
+This example demonstrates how to build an agent that greets users with their YouTube channel name using AgentCore Identity and AgentCore Gateway with OAuth 2.0 Authorization Code Grant (3-legged OAuth). The agent securely accesses Google's YouTube Data API on behalf of authenticated users to retrieve their channel information.
 
 **Use Case**: User-delegated access to external APIs where the agent acts on behalf of an authenticated user without ever seeing their credentials.
 
 **Prerequisites**:
 - AWS account with AgentCore access
-- Google Cloud Console project with OAuth 2.0 credentials
+- Google Cloud Console project with OAuth 2.0 credentials and YouTube Data API v3 enabled
 - Python 3.10+
 - AWS credentials configured
 - `uv` for dependency management
@@ -27,8 +27,9 @@ This example demonstrates how to build an agent that greets users with their Goo
 
 3. Configure your credentials in `.env`:
    - Set AWS region
-   - Add Google OAuth client ID and secret
+   - Add YouTube OAuth client ID and secret (from Google Cloud Console)
    - Configure redirect URI
+   - Enable YouTube Data API v3 in Google Cloud Console
 
 4. Run the example:
    ```bash
@@ -40,94 +41,138 @@ This example demonstrates how to build an agent that greets users with their Goo
 ```mermaid
 sequenceDiagram
     participant User
-    participant Agent
-    participant OAuth2Server as OAuth2 Callback Server
-    participant Identity as AgentCore Identity
-    participant Gateway as AgentCore Gateway
-    participant Google as Google OAuth
+    participant Cognito as AWS Cognito<br/>(External IdP)
+    participant Identity as AgentCore Identity<br/>(Spec §4)
+    participant Agent as Agent<br/>(Spec §2)
+    participant OAuth2Server as OAuth2 Callback Server<br/>(Spec §1, Stateless)
+    participant Gateway as AgentCore Gateway<br/>(Spec §3)
+    participant YouTube as YouTube Data API
 
-    User->>Agent: Request greeting
-    Agent->>Gateway: Call get_profile tool
-    Gateway->>Identity: Check user authorization
-    Identity-->>Gateway: No token found
-    Gateway-->>Agent: Return elicitation URL
+    Note over User,Identity: Inbound Authentication (via AgentCore Identity)
+    User->>Identity: Authenticate request
+    Identity->>Cognito: Delegate authentication
+    Cognito-->>Identity: Cognito JWT
+    Identity-->>User: AgentCore JWT (bearer_token)
+    
+    Note over User,Gateway: First Request (No Outbound OAuth Token)
+    User->>Agent: Request greeting with bearer_token
+    Agent->>Agent: greet_user(bearer_token) [§2]
+    Agent->>Gateway: Call get_channel tool with bearer_token
+    Gateway->>Identity: Check user's outbound OAuth token
+    Identity-->>Gateway: No YouTube OAuth token found
+    Gateway-->>Agent: Return elicitation URL with session_id & bearer_token
     Agent->>User: Display OAuth consent URL
-    User->>Google: Authorize access
-    Google->>OAuth2Server: Redirect with auth code
-    OAuth2Server->>Identity: Complete OAuth flow
-    Identity-->>OAuth2Server: Session bound
+    
+    Note over User,Identity: Outbound OAuth Authorization (via AgentCore Identity)
+    User->>YouTube: Authorize access (via browser)
+    YouTube->>OAuth2Server: Redirect to /oauth2/callback?session_id=<id>&bearer_token=<jwt>
+    OAuth2Server->>OAuth2Server: _handle_oauth2_callback(session_id, bearer_token) [§1]
+    OAuth2Server->>Identity: complete_resource_token_auth(session_id, bearer_token) [§4]
+    Note over Identity: Store YouTube OAuth token<br/>for user
+    Identity-->>OAuth2Server: Success
     OAuth2Server->>User: Success page
-    User->>Agent: Retry request
-    Agent->>Gateway: Call get_profile tool
-    Gateway->>Identity: Get user token
-    Identity-->>Gateway: Return access token
-    Gateway->>Google: GET /people/me
-    Google-->>Gateway: Profile data
-    Gateway-->>Agent: Profile response
-    Agent->>User: Hello, [Name]!
+    
+    Note over User,YouTube: Second Request (Outbound OAuth Authorized)
+    User->>Agent: Retry request with bearer_token
+    Agent->>Agent: greet_user(bearer_token) [§2]
+    Agent->>Gateway: Call get_channel tool with bearer_token
+    Gateway->>Identity: Get user's YouTube OAuth token
+    Identity-->>Gateway: Return YouTube access token
+    Gateway->>YouTube: GET /youtube/v3/channels?part=snippet&mine=true
+    YouTube-->>Gateway: Channel data
+    Gateway-->>Agent: Channel response
+    Agent->>User: Hello, [Channel Name]!
 ```
+
+**Component Specifications**:
+- **Cognito (AWS Cognito)**: External identity provider integrated with AgentCore Identity for user authentication
+- **Identity (AgentCore Identity)**: See Section 4 - Single point of authentication flow manager:
+  - **Inbound Authentication**: Manages Cognito integration, delegates authentication to Cognito, and issues AgentCore JWT (bearer_token)
+  - **Outbound OAuth**: Manages OAuth sessions with external resources (e.g., YouTube) and binds them to authenticated users
+  - **Token Management**: Securely stores and manages OAuth tokens for users
+- **OAuth2Server (Stateless)**: See Section 1 - Stateless callback handler that receives OAuth callbacks and delegates token storage to AgentCore Identity
+- **Gateway**: See Section 3 - Proxies YouTube API calls with OAuth authentication
+- **Agent**: See Section 2 - Orchestrates greeting flow and passes bearer_token for user identification
+- **OAuth Flow**: See Section 1 "Complete OAuth Flow Process" for detailed 7-step sequence
 
 ## Specifications
 
 ### 1. OAuth2 Callback Server (`oauth2_callback_server.py`)
 
-**Purpose**: Local HTTP server that handles OAuth 2.0 callback redirects from Google.
+**Purpose**: Stateless HTTP server that handles OAuth 2.0 authorization code callbacks and delegates token storage to AgentCore Identity.
+
+**Complete OAuth Flow Process**:
+1. **Inbound Authentication**: User authenticates via AgentCore Identity, which delegates to Cognito and returns AgentCore JWT (bearer_token)
+2. **Elicitation**: Agent passes bearer_token to Gateway, which detects outbound authorization required and returns YouTube authorization URL with session_id and bearer_token
+3. **User Consent**: User visits authorization URL and grants permission to access their YouTube channel
+4. **Callback**: YouTube redirects to `/oauth2/callback?session_id=<id>&bearer_token=<jwt>`
+5. **Token Exchange**: Callback handler receives bearer_token from query params and calls `identity_client.complete_resource_token_auth(session_id, bearer_token)` 
+6. **Token Storage**: AgentCore Identity exchanges authorization code for YouTube OAuth token and stores it securely, bound to user
+7. **Resource Access**: Agent can now call YouTube Data API - Gateway retrieves user's YouTube OAuth token from AgentCore Identity
 
 **Key Functions**:
-- `get_oauth2_callback_base_url() -> str`: Returns the callback URL for OAuth provider redirects
-- `store_token_in_oauth2_callback_server(identity_client, user_token_identifier)`: Stores user token identifier before OAuth flow
-- `OAuth2CallbackServer.__init__(region: str)`: Initializes FastAPI server with Identity client
-- `OAuth2CallbackServer.start()`: Starts the callback server on port 9090
+- `get_oauth2_callback_base_url() -> str`: Returns callback URL for OAuth provider redirects
+- `OAuth2CallbackServer.__init__(region: str)`: Initializes stateless FastAPI server with Identity client
+- `OAuth2CallbackServer._handle_oauth2_callback(session_id: str, bearer_token: str)`: Receives OAuth callback and delegates to AgentCore Identity (stateless - no token storage)
 
 **Endpoints**:
-- `POST /userIdentifier/token`: Store user token identifier
 - `GET /ping`: Health check
-- `GET /oauth2/callback?session_id=<id>`: OAuth callback handler
+- `GET /oauth2/callback?session_id=<id>&bearer_token=<jwt>`: OAuth callback handler (stateless - passes bearer_token to Identity)
 
 **Configuration**:
 - Port: 9090 (configurable via constant)
 - Supports both localhost and SageMaker Workshop Studio environments
 
+**Stateless Design**: 
+- No in-memory token storage
+- No session state management
+- Bearer token passed via query parameter from elicitation URL
+- All token storage and user binding handled by AgentCore Identity token vault
+- Supports concurrent multi-user OAuth flows without race conditions
+
 ### 2. Agent Implementation (`say_hello_to_authorized_customer/agent.py`)
 
-**Purpose**: Core agent logic that orchestrates the greeting flow.
+**Purpose**: Core agent logic that orchestrates the greeting flow with user authentication context.
 
 **Key Functions**:
 - `create_agent(gateway_arn: str, region: str) -> Agent`: Creates agent with Gateway tools
-- `greet_user(agent: Agent, user_token: str) -> str`: Executes greeting flow with user context
+- `greet_user(agent: Agent, bearer_token: str) -> str`: Executes greeting flow, passing bearer_token for user identification
 
 **Behavior**:
-- Detects elicitation responses from Gateway
+- Passes bearer_token to Gateway for user identification
+- Detects elicitation responses from Gateway (contains session_id and bearer_token in callback URL)
 - Displays OAuth consent URL to user
 - Retries tool call after user authorization
-- Formats greeting message with profile name
+- Formats greeting message with YouTube channel name
 
-### 3. Gateway Configuration (`gateway_config.py`)
+### 3. Gateway (`gateway_for_tools.py`)
 
 **Purpose**: Manages AgentCore Gateway creation and configuration.
 
 **Key Functions**:
-- `create_gateway(name: str, google_client_id: str, google_client_secret: str, callback_url: str, region: str) -> str`: Creates Gateway with Google OAuth target
+- `create_gateway(name: str, youtube_client_id: str, youtube_client_secret: str, callback_url: str, region: str) -> str`: Creates Gateway with YouTube OAuth target
 - `delete_gateway(gateway_arn: str, region: str)`: Cleanup function
 
 **Gateway Configuration**:
-- Target: Google People API (`https://people.googleapis.com`)
-- OAuth Scopes: `profile`, `openid`
+- Target: YouTube Data API v3 (`https://www.googleapis.com/youtube/v3`)
+- OAuth Scopes: `https://www.googleapis.com/auth/youtube.readonly`
 - Outbound Auth: Authorization Code Grant
 - MCP Version: `2025-11-25`
 
-### 4. Identity Configuration (`identity_config.py`)
+### 4. Identity (`identity_for_authorization.py`)
 
-**Purpose**: Manages AgentCore Identity workload identity and user token binding.
+**Purpose**: Manages AgentCore Identity as a single point of authentication flow manager for secure token storage and user binding.
 
 **Key Functions**:
 - `create_workload_identity(name: str, callback_url: str, region: str) -> str`: Creates workload identity with OAuth return URL
-- `get_user_token_identifier(id_token: str) -> UserTokenIdentifier`: Extracts user identifier from JWT
+- `complete_resource_token_auth(session_id: str, bearer_token: str)`: Exchanges authorization code for YouTube OAuth token and stores it securely, bound to user identified by bearer_token
 - `delete_workload_identity(identity_arn: str, region: str)`: Cleanup function
 
 **Identity Configuration**:
-- Allowed OAuth return URLs: Callback server URL
-- User identifier source: JWT `sub` claim
+- Allowed OAuth return URLs: Callback server URL (with bearer_token query parameter)
+- User identifier source: JWT `sub` claim from bearer_token
+- **Token Management**: AgentCore Identity manages OAuth token storage and user binding
+- **Dual Role**: Manages both inbound authentication (user → agent via Cognito) and outbound OAuth (agent → YouTube)
 
 ### 5. Main Entry Point (`main.py`)
 
@@ -135,12 +180,13 @@ sequenceDiagram
 
 **Flow**:
 1. Load configuration from `.env`
-2. Start OAuth2 callback server
-3. Create workload identity
+2. Start stateless OAuth2 callback server
+3. Create workload identity with callback URL (including bearer_token parameter)
 4. Create gateway with OAuth configuration
 5. Create agent with gateway tools
-6. Execute greeting flow
-7. Cleanup resources
+6. Get bearer_token from inbound authentication
+7. Execute greeting flow with bearer_token
+8. Cleanup resources
 
 **Error Handling**:
 - Validates environment variables
@@ -153,18 +199,33 @@ sequenceDiagram
 **Required Variables**:
 ```
 AWS_REGION=us-east-1
-GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
-GOOGLE_CLIENT_SECRET=your-client-secret
+YOUTUBE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+YOUTUBE_CLIENT_SECRET=your-client-secret
 CALLBACK_URL=http://localhost:9090/oauth2/callback
 ```
 
+**Note**: Obtain YouTube OAuth credentials from [Google Cloud Console](https://console.cloud.google.com/) and enable YouTube Data API v3.
+
 ## Security Considerations for Production
+
+### Stateless Callback Server Design
+- **No token storage**: Callback server is stateless and doesn't store JWTs or OAuth tokens
+- **Bearer token in URL**: Bearer token passed via query parameter in callback URL (HTTPS required in production)
+- **Multi-user support**: Stateless design eliminates race conditions in concurrent OAuth flows
+- **No session management**: All state managed by AgentCore Identity
+
+### AgentCore Identity Token Management
+- **Secure storage**: OAuth tokens managed by AgentCore Identity service
+- **User binding**: Tokens bound to users via JWT `sub` claim from bearer_token
+- **Automatic management**: Token lifecycle handled by AgentCore Identity
+- **Session tracking**: OAuth sessions tracked via session_id from elicitation URL
+- **Multi-user support**: Concurrent OAuth flows supported natively
 
 ### Credential Management
 - **Never hardcode credentials**: Use AWS Secrets Manager or environment variables
-- **Rotate OAuth secrets**: Implement regular rotation of Google OAuth client secrets
-- **Secure token storage**: Use encrypted storage for user tokens in production
-- **Callback server security**: Use HTTPS for callback URLs in production environments
+- **Rotate OAuth secrets**: Implement regular rotation of YouTube OAuth client secrets
+- **HTTPS for callbacks**: Use HTTPS for callback URLs in production (required for bearer_token in URL)
+- **JWT validation**: AgentCore Identity validates JWT signatures before token binding
 
 ### Input Validation
 - **Validate OAuth state parameter**: Prevent CSRF attacks in OAuth flow
@@ -172,8 +233,8 @@ CALLBACK_URL=http://localhost:9090/oauth2/callback
 - **Verify JWT signatures**: Validate identity tokens before extracting claims
 
 ### Rate Limiting
-- **Implement request throttling**: Prevent abuse of Google API quotas
-- **Handle rate limit errors**: Gracefully handle 429 responses from Google
+- **Implement request throttling**: Prevent abuse of YouTube API quotas
+- **Handle rate limit errors**: Gracefully handle 429 responses from YouTube
 - **Monitor API usage**: Track and alert on unusual patterns
 
 ### Error Handling
@@ -200,7 +261,7 @@ CALLBACK_URL=http://localhost:9090/oauth2/callback
 
 ### OAuth Flow Issues
 
-**Problem**: "Redirect URI mismatch" error from Google
+**Problem**: "Redirect URI mismatch" error from YouTube/Google
 - **Solution**: Ensure `CALLBACK_URL` in `.env` matches the authorized redirect URI in Google Cloud Console
 - **Check**: Verify the callback server is accessible at the configured URL
 
@@ -216,18 +277,15 @@ CALLBACK_URL=http://localhost:9090/oauth2/callback
 - **Check**: Use AWS CLI to list gateways: `aws bedrock-agentcore list-gateways`
 
 **Problem**: "Invalid OAuth configuration" error
-- **Solution**: Verify Google OAuth client ID and secret are correct
-- **Check**: Ensure OAuth scopes are properly configured
+- **Solution**: Verify YouTube OAuth client ID and secret are correct
+- **Check**: Ensure OAuth scopes are properly configured and YouTube Data API v3 is enabled
 
 ### Identity Issues
 
 **Problem**: "User token identifier not found"
-- **Solution**: Ensure the user has completed the OAuth flow
+- **Solution**: Ensure bearer_token is passed correctly in the callback URL
 - **Check**: Verify the JWT token contains the expected `sub` claim
-
-**Problem**: "Session binding failed"
-- **Solution**: Ensure the callback server stored the user token identifier before OAuth flow
-- **Debug**: Check callback server logs for token storage events
+- **Debug**: Check AgentCore Identity logs for token validation errors
 
 ### Agent Execution Issues
 
@@ -235,9 +293,10 @@ CALLBACK_URL=http://localhost:9090/oauth2/callback
 - **Solution**: Verify the Gateway is configured with MCP version `2025-11-25`
 - **Check**: Ensure the agent is checking for elicitation in tool responses
 
-**Problem**: "Profile not found" error
+**Problem**: "Channel not found" error
 - **Solution**: Verify the user granted the required OAuth scopes
-- **Check**: Ensure the Google People API is enabled in Google Cloud Console
+- **Check**: Ensure the YouTube Data API v3 is enabled in Google Cloud Console
+- **Verify**: User has a YouTube channel associated with their Google account
 
 ### Common Error Messages
 
@@ -274,8 +333,14 @@ aws bedrock-agentcore list-workload-identities --region us-east-1
 
 ## References
 
-- [AgentCore Gateway Documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/agentcore-gateway.html)
-- [AgentCore Identity Documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/agentcore-identity.html)
-- [OAuth 2.0 Authorization Code Grant](https://oauth.net/2/grant-types/authorization-code/)
-- [Google People API](https://developers.google.com/people)
-- [MCP URL Mode Elicitation](https://blog.modelcontextprotocol.io/posts/2025-11-25-first-mcp-anniversary/#url-mode-elicitation-secure-out-of-band-interactions)
+### AgentCore Documentation
+- [AgentCore Identity API Reference](https://aws.github.io/bedrock-agentcore-starter-toolkit/api-reference/identity.md) - Complete Identity client API documentation
+- [AgentCore Gateway Integration Guide](https://aws.github.io/bedrock-agentcore-starter-toolkit/examples/gateway-integration.md) - Gateway setup and OAuth token management patterns
+- [AgentCore Gateway Documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/agentcore-gateway.html) - Official AWS Gateway documentation
+- [AgentCore Identity Documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/agentcore-identity.html) - Official AWS Identity documentation
+
+### External Resources
+- [OAuth 2.0 Authorization Code Grant](https://oauth.net/2/grant-types/authorization-code/) - OAuth 2.0 specification
+- [YouTube Data API v3](https://developers.google.com/youtube/v3) - YouTube API documentation
+- [YouTube OAuth Scopes](https://developers.google.com/youtube/v3/guides/auth/server-side-web-apps) - YouTube OAuth guide
+- [MCP URL Mode Elicitation](https://blog.modelcontextprotocol.io/posts/2025-11-25-first-mcp-anniversary/#url-mode-elicitation-secure-out-of-band-interactions) - MCP elicitation pattern
