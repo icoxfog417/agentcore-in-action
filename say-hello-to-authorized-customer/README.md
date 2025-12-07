@@ -31,6 +31,7 @@ This example demonstrates how to build an agent that greets users with personali
 3. Configure your credentials in `.env`:
    - Set AWS region
    - Add YouTube OAuth client ID and secret (from Google Cloud Console)
+   - Set `BASE_URL` (default: `http://localhost:8080`, change if using port forwarding)
    - Enable YouTube Data API v3 in Google Cloud Console
 
 4. Build AgentCore components:
@@ -54,7 +55,7 @@ This example demonstrates how to build an agent that greets users with personali
    ```bash
    uv run python main.py
    ```
-   - Server starts on http://localhost:9090
+   - Server starts on http://localhost:8080
    - Open browser and click "Login with Cognito"
    - Enter your username and password in Cognito Hosted UI
    - Authorize YouTube access when prompted
@@ -68,14 +69,14 @@ This diagram shows the **runtime behavior** when a user interacts with the agent
 sequenceDiagram
     participant User
     participant Browser
-    participant Server as OAuth2 Server<br/>(localhost:9090)
+    participant Server as OAuth2 Server<br/>(localhost:8080)
     participant Cognito as Cognito Hosted UI
     participant Gateway as AgentCore Gateway
     participant Identity as AgentCore Identity
     participant YouTube as YouTube API
 
     Note over User,Cognito: Inbound Authentication (Cognito Authorization Code Flow)
-    User->>Browser: Open http://localhost:9090
+    User->>Browser: Open http://localhost:8080
     Browser->>Server: GET /
     Server-->>Browser: Show "Login with Cognito" button
     Browser->>Cognito: Click login → Authorization Code flow
@@ -115,7 +116,7 @@ sequenceDiagram
 
 **Runtime Components**:
 - **Cognito Hosted UI**: Web-based login for user authentication (Authorization Code flow)
-- **OAuth2 Server (localhost:9090)**: Handles both Cognito and YouTube OAuth callbacks
+- **OAuth2 Server (localhost:8080)**: Handles both Cognito and YouTube OAuth callbacks
   - `/`: Home page with "Login with Cognito" button
   - `/cognito/callback`: Exchanges Cognito auth code for access token with custom scope
   - `/oauth2/callback`: Completes YouTube OAuth and retries Gateway call
@@ -225,7 +226,7 @@ sequenceDiagram
     
     Note over Construct,ControlPlane: Step 3: Create Workload Identity
     Note right of Construct: Register local callback URL<br/>for OAuth session binding
-    Construct->>ControlPlane: create_workload_identity(<br/>  allowedResourceOauth2ReturnUrls:<br/>    ["http://localhost:9090/oauth2/callback"]<br/>)
+    Construct->>ControlPlane: create_workload_identity(<br/>  allowedResourceOauth2ReturnUrls:<br/>    ["http://localhost:8080/oauth2/callback"]<br/>)
     ControlPlane-->>Construct: identity_arn
     
     Note over Construct,ControlPlane: Step 4: Create OAuth Credential Provider (Outbound Auth)
@@ -253,7 +254,7 @@ sequenceDiagram
    - Provides: JWT tokens that identify users
 3. **Workload Identity**: Registers local callback URL for OAuth session binding
    - Enables: AgentCore Identity to redirect to local callback server
-   - Registers: `http://localhost:9090/oauth2/callback` as allowed return URL
+   - Registers: `http://localhost:8080/oauth2/callback` as allowed return URL
 4. **OAuth Credential Provider (Outbound Auth)**: Stores YouTube OAuth configuration
    - Enables: "Gateway → YouTube" connection in Demonstration Flow
    - Contains: YouTube client_id, client_secret, OAuth endpoints
@@ -377,7 +378,7 @@ if "error" in result and result["error"].get("code") == -32001:
 - `GET /oauth2/callback?session_id=X&bearer_token=Y`: YouTube OAuth callback
 
 **Configuration**:
-- Port: 9090 (configurable via constant)
+- Port: 8080 (configurable via constant)
 - Localhost only
 
 **Implementation**:
@@ -439,7 +440,7 @@ client_response = cognito_client.create_user_pool_client(
     AllowedOAuthFlows=["code"],
     AllowedOAuthFlowsUserPoolClient=True,
     AllowedOAuthScopes=[f"{resource_server_id}/youtube-target"],
-    CallbackURLs=["http://localhost:9090/cognito/callback"],
+    CallbackURLs=["http://localhost:8080/cognito/callback"],
     SupportedIdentityProviders=["COGNITO"]
 )
 cognito_client_id = client_response["UserPoolClient"]["ClientId"]
@@ -488,11 +489,11 @@ cognito_client.admin_set_user_password(
 ```
 
 **User authentication flow** (Authorization Code):
-1. User opens http://localhost:9090 in browser
+1. User opens http://localhost:8080 in browser
 2. Clicks "Login with Cognito" button
 3. Redirected to Cognito Hosted UI: `https://{domain_prefix}.auth.{region}.amazoncognito.com/oauth2/authorize`
 4. User enters username/password
-5. Cognito redirects to callback: `http://localhost:9090/cognito/callback?code=XXX`
+5. Cognito redirects to callback: `http://localhost:8080/cognito/callback?code=XXX`
 6. Server exchanges code for access token with custom scope
 7. Access token contains `youtube-gateway-resources/youtube-target` scope
 8. Server uses access token for all Gateway requests
@@ -602,7 +603,7 @@ target_response = control_client.create_gateway_target(
             "oauthCredentialProvider": {
                 "providerArn": provider_arn,
                 "grantType": "AUTHORIZATION_CODE",
-                "defaultReturnUrl": "http://localhost:9090/oauth2/callback",
+                "defaultReturnUrl": "http://localhost:8080/oauth2/callback",
                 "scopes": ["https://www.googleapis.com/auth/youtube.readonly"]
             }
         }
@@ -651,7 +652,7 @@ control_client = boto3.client("bedrock-agentcore-control", region_name=region)
 # Create workload identity
 identity_response = control_client.create_workload_identity(
     name="youtube-workload-identity",
-    allowedResourceOauth2ReturnUrls=["http://localhost:9090/oauth2/callback"]
+    allowedResourceOauth2ReturnUrls=["http://localhost:8080/oauth2/callback"]
 )
 
 identity_arn = identity_response["workloadIdentityArn"]
@@ -721,6 +722,10 @@ identity_client.complete_resource_token_auth(session_id, access_token)
 **Steps**:
 1. Create IAM role for Gateway
 2. Create Cognito user pool and client (Inbound Auth)
+   - **OAuth Scopes**: `["openid", "youtube-gateway-resources/youtube-target"]`
+     - `openid`: Required by Cognito Authorization Code flow to issue ID token
+     - `youtube-gateway-resources/youtube-target`: Custom scope that authorizes access to Gateway's YouTube target
+   - Gateway validates access token contains the custom scope before allowing API calls
 3. Create Workload Identity with allowed callback URLs
 4. Create OAuth credential provider for YouTube (Outbound Auth)
 5. Create Gateway with Cognito authorizer
@@ -781,8 +786,8 @@ uv run python main.py [--signup --username <username> --password <password>]
 **Flow**:
 1. Load configuration from `config.json`
 2. **Optional Signup**: If `--signup` flag provided, create user in Cognito
-3. Start OAuth2 callback server on port 9090
-4. Display URL: http://localhost:9090
+3. Start OAuth2 callback server on port 8080
+4. Display URL: http://localhost:8080
 5. Server handles:
    - Cognito Authorization Code flow
    - YouTube OAuth flow
@@ -790,7 +795,7 @@ uv run python main.py [--signup --username <username> --password <password>]
    - Greeting display
 
 **User Interaction**:
-1. Open http://localhost:9090 in browser
+1. Open http://localhost:8080 in browser
 2. Click "Login with Cognito"
 3. Enter username/password in Cognito Hosted UI
 4. Authorize YouTube when prompted
@@ -815,7 +820,7 @@ uv run python main.py [--signup --username <username> --password <password>]
 AWS_REGION=us-east-1
 YOUTUBE_CLIENT_ID=your-client-id.apps.googleusercontent.com
 YOUTUBE_CLIENT_SECRET=your-client-secret
-CALLBACK_URL=http://localhost:9090/oauth2/callback
+CALLBACK_URL=http://localhost:8080/oauth2/callback
 ```
 
 **Setup Steps**:
@@ -870,11 +875,11 @@ CALLBACK_URL=http://localhost:9090/oauth2/callback
 
 **"Redirect URI mismatch" from Google**
 - Register `oauth_callback_url` from `config.json` in Google Cloud Console → Credentials → Authorized redirect URIs
-- Note: This is the AgentCore Identity URL, not `http://localhost:9090/oauth2/callback`
+- Note: This is the AgentCore Identity URL, not `http://localhost:8080/oauth2/callback`
 
 **OAuth callback never completes**
-- Verify callback server is running on port 9090
-- Check firewall allows localhost:9090
+- Verify callback server is running on port 8080
+- Check firewall allows localhost:8080
 
 **User closed browser during OAuth**
 - Simply retry - new elicitation URL will be generated
