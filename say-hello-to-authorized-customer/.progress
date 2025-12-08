@@ -1,0 +1,249 @@
+# Development Progress
+
+## Iteration 1: [2025-12-08]
+
+### Specification
+- Goal: Implement working YouTube OAuth agent example with AgentCore Identity and Gateway
+- Key decisions:
+  - Use raw JSON-RPC calls (not Strands MCP client) for MCP protocol version 2025-11-25
+  - Separate construction (construct.py) from demonstration (main.py)
+  - Use Authorization Code flow for Cognito (supports custom scopes)
+  - Stateful OAuth2 callback server maintains access token between flows
+
+### Implementation
+- `say_hello_to_authorized_customer/agent.py`: Gateway tool calls with OAuth _meta
+- `oauth2_callback_server.py`: FastAPI server handling Cognito and YouTube OAuth flows
+- `construct.py`: Build all AgentCore resources (IAM, Cognito, Identity, Gateway, Target)
+- `main.py`: Entry point with signup mode and server startup
+- `tests/`: Test suite with 10 tests covering all specifications
+
+### Test
+- Command: uv run pytest tests/ -v
+- Result: 10/10 passing
+
+### Evaluation
+- What worked:
+  - Test-driven approach identified all required components
+  - Minimal implementation satisfies specifications
+  - Clear separation between construction and demonstration
+  
+- Challenges:
+  - Import paths required sys.path manipulation in tests
+  - Need to validate with real AWS resources (next iteration)
+
+- Next iteration focus:
+  - Test construct.py with real AWS resources
+  - Validate OAuth flows end-to-end
+  - Add error handling for common failure scenarios
+
+## Iteration 2: [2025-12-08]
+
+### Specification
+- Goal: Build AgentCore infrastructure and validate construction
+- Key fixes needed:
+  - OAuth provider response key: `credentialProviderArn` not `providerArn`
+  - Gateway status check: `READY` not `AVAILABLE`
+  - Workload identity deletion: use `name` parameter not `workloadIdentityArn`
+
+### Implementation
+- Fixed `construct.py`:
+  - OAuth provider response parsing
+  - Gateway status polling
+  - Workload identity cleanup
+- Cleaned up test imports (removed sys.path with tests/__init__.py)
+
+### Test
+- Command: uv run python construct.py
+- Result: ✅ All resources created successfully
+  - IAM role: youtube-gateway-role-1765168720
+  - Cognito pool: us-east-1_Yf10YOTwO
+  - Workload identity: youtube-workload-identity-1765168723
+  - OAuth provider: youtube-oauth-provider-1765168723
+  - Gateway: youtube-gateway-1765168724-c4egu3hgax (READY)
+  - Target: KJXQH1XD2O
+  - Config saved to config.json
+
+### Evaluation
+- What worked:
+  - Construction completed in ~5 seconds
+  - All resources created and linked correctly
+  - OAuth callback URL generated for Google registration
+  
+- Challenges:
+  - Initial API response key mismatch
+  - Gateway status polling used wrong status value
+  - Multiple failed attempts created duplicate resources
+
+- Next iteration focus:
+  - Register OAuth callback URL with Google
+  - Create Cognito user
+  - Test end-to-end OAuth flow with main.py
+
+## Iteration 3: [2025-12-08]
+
+### Specification
+- Goal: Debug Gateway 403 errors and validate JWT authorization
+- Key investigation: Why does Gateway reject Cognito access tokens?
+
+### Implementation Trials
+
+**Trial 1: Added `allowedScopes` to Gateway configuration**
+- Modified `construct.py` to include `allowedScopes: ["youtube-gateway-resources/youtube-target"]`
+- Reasoning: Documentation states Gateway validates scopes in JWT tokens
+- Result: ❌ Gateway created but still returned 403
+
+**Trial 2: Fixed OpenAPI schema validation**
+- Issue: Gateway target status = FAILED
+- Error: `attribute paths.'/channels'(get).responses is missing`
+- Fix: Added `responses: {"200": {"description": "Successful response"}}` to each operation
+- Result: ✅ Target status = READY
+
+**Trial 3: Fixed cleanup order**
+- Issue: Cannot delete gateway with associated targets
+- Fix: Delete target first, then gateway
+- Also fixed: OAuth provider deletion uses `name` parameter, not `providerArn`
+- Result: ✅ Cleanup works correctly
+
+**Trial 4: Investigated 403 error with CloudWatch logs**
+- Enabled Gateway CloudWatch logging
+- Created test script to generate logs with different auth scenarios
+- Logs showed: "Missing Bearer token" and "Invalid Bearer token" errors work correctly
+- Result: ✅ Logging infrastructure working
+
+**Trial 5: Examined Gateway authorizer configuration**
+- Command: `aws bedrock-agentcore-control get-gateway --query 'authorizerConfiguration'`
+- Discovery: Gateway configuration only shows `allowedClients`, NOT `allowedScopes`
+- Result: ❌ `allowedScopes` was not applied despite being in construct.py
+
+**Trial 6: Attempted to update Gateway with `allowedScopes`**
+- Command: `aws bedrock-agentcore-control update-gateway --authorizer-configuration`
+- Error: `Unknown parameter in authorizerConfiguration.customJWTAuthorizer: "allowedScopes"`
+- Result: ❌ **API rejects `allowedScopes` parameter entirely**
+
+### Test
+- Command: Multiple Gateway API calls with different configurations
+- Result: **CRITICAL FINDING**: API does not support `allowedScopes` parameter
+
+### Evaluation
+
+**What worked:**
+- CloudWatch logging enabled successful debugging
+- OpenAPI schema fix resolved target FAILED status
+- Cleanup order fix prevents deletion errors
+- Test script successfully generated logs for analysis
+
+**Critical Discovery:**
+- **Documentation vs Reality Gap**: AWS documentation for `CustomJWTAuthorizerConfiguration` lists `allowedScopes` as a valid parameter, but the actual API rejects it
+- API validation error: `Unknown parameter: "allowedScopes", must be one of: discoveryUrl, allowedAudience, allowedClients`
+- This means Gateway JWT authorizer **cannot validate OAuth scopes** directly
+
+**Root Cause of 403:**
+- Cognito access token contains custom scope: `youtube-gateway-resources/youtube-target`
+- Gateway JWT authorizer only validates: `discoveryUrl`, `allowedAudience`, `allowedClients`
+- Gateway cannot validate the custom scope, causing authorization failure
+
+**Challenges:**
+- Spent significant time trying to add `allowedScopes` based on documentation
+- Multiple resource recreations due to configuration issues
+- Port forwarding complications (8080 vs 8081)
+- Cannot complete end-to-end OAuth flow due to Gateway authorization failure
+
+**Next iteration focus:**
+- **Option 1**: Use `customClaims` to validate scope claim manually
+- **Option 2**: Use `allowedAudience` instead of custom scopes
+- **Option 3**: Switch to IAM authorization instead of JWT
+- **Option 4**: Document this as a limitation and use simpler auth pattern
+- Need to choose approach and implement working authorization
+
+## Iteration 5: [2025-12-08]
+### Specification
+- Goal: Investigate 403 gateway errors and implement OAuth authentication
+- Key decisions: Use OAuth2 authorization_code flow with Cognito, automate browser testing with Selenium
+
+### Implementation
+- Created `tests/test_minimal_auth.py` with OAuth flow tests
+- Added Selenium for automated browser interaction
+- Fixed token exchange to remove unnecessary scope parameter in `oauth2_callback_server.py`
+
+### Test
+- Command: uv run pytest tests/test_minimal_auth.py -v
+- Result: 4/4 passing
+  - ✅ test_oauth_flow_info - OAuth infrastructure setup
+  - ✅ test_gateway_with_oauth_token - Gateway without scope requirement
+  - ✅ test_gateway_with_oauth_token_with_scope - Gateway with scope requirement
+  - ✅ test_gateway_with_automated_oauth - Full automated OAuth flow
+
+### Evaluation
+**Root Cause Identified:**
+- USER_PASSWORD_AUTH tokens don't work with gateway JWT authorizer (returns 401 "Invalid Bearer token")
+- Gateway requires OAuth2 authorization_code flow tokens
+- Must use ACCESS TOKEN (not ID TOKEN) - ID tokens don't contain scope claims
+- Scopes are only present in access tokens from OAuth2 flows
+
+**Key Findings:**
+1. Gateway JWT authorizer validates:
+   - Token signature via OIDC discovery endpoint
+   - `aud` claim matches `allowedClients`
+   - `scope` claim contains required scopes (only in access tokens)
+
+2. Cognito OAuth configuration:
+   - Must enable OAuth flows: `AllowedOAuthFlows=["code"]`
+   - Must specify scopes: `AllowedOAuthScopes=["openid", "resource/scope"]`
+   - Callback URLs must match exactly (no wildcard ports)
+
+3. Token exchange:
+   - Don't re-specify scopes in token exchange request
+   - Scopes are already encoded in authorization code
+
+**Applied Fix:**
+- File: `oauth2_callback_server.py` line 77-78
+- Change: Removed `scope` parameter from token exchange
+- Reason: Scopes already in auth code, re-specifying can cause issues
+
+**Implementation Status:**
+- ✅ OAuth flow correctly configured in `construct.py`
+- ✅ Access token correctly used in `oauth2_callback_server.py`
+- ✅ Gateway authorization working with scope validation
+- ✅ Automated testing with Selenium for browser interaction
+
+### Next Iteration Focus
+- Update README.md with OAuth flow documentation
+- Add troubleshooting guide for common OAuth issues
+- Consider adding token refresh logic for long-running sessions
+
+
+## Iteration 4: 2025-12-08
+### Specification
+- Goal: Implement OAuth authorization code grant flow with YouTube API
+- Key decisions:
+  - Use AgentCore Gateway with OAuth2 credential provider
+  - Implement session binding with complete_resource_token_auth
+  - Remove _meta field from initial call to avoid ELB 403
+
+### Implementation
+- construct.py: Added IAM policy attachment, removed allowedScopes from gateway authorizer
+- agent.py: Modified call_gateway_tool to conditionally add _meta, updated OAuth elicitation error code to -32042
+- oauth2_callback_server.py: Implemented session binding with UserTokenIdentifier, added JSON parsing for YouTube responses
+- Target name changed from youtube-target to YouTubeTarget (avoid hyphens)
+
+### Test
+- Command: Manual OAuth flow test via browser
+- Result: ✅ Complete OAuth flow working
+  - OAuth elicitation received
+  - User authorized YouTube access
+  - Session binding completed successfully
+  - Both API calls (getChannels, getSubscriptions) returned data
+  - Formatted greeting: "Hello Takahiro Kubo! You subscribe to もこうの実況 that has fantastic videos!"
+
+### Evaluation
+- What worked:
+  - Removing _meta from initial call prevents ELB 403
+  - Session binding with {"userToken": access_token} format
+  - Calling without _meta after session binding
+  - Gateway target naming without hyphens
+- Key discoveries:
+  - _meta field causes ELB 403 on first call
+  - OAuth elicitation uses error code -32042 with elicitations array
+  - complete_resource_token_auth requires sessionUri and userIdentifier dict
+  - After session binding, subsequent calls work without _meta
+- Next iteration focus: Documentation and cleanup
