@@ -14,10 +14,12 @@ dependencies = [
     "uvicorn>=0.32.0",
     "pyjwt>=2.9.0",
     "python-dotenv>=1.0.0",
+    "requests>=2.32.5",
 ]
 
 [dependency-groups]
 dev = [
     "ruff>=0.14.8",
     "pytest>=8.3.0",
+    "selenium>=4.27.0",
 ]
