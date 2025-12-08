@@ -229,30 +229,20 @@ sequenceDiagram
 **Key Functions**:
 - `call_gateway_tool(gateway_url, bearer_token, tool_name, arguments, return_url, force_auth)`: Makes raw JSON-RPC call
   - Uses MCP protocol version `2025-11-25` (required for OAuth elicitation)
-  - Includes `_meta` parameter with OAuth configuration
   - Returns JSON-RPC response
 - `greet_user(gateway_url, bearer_token, return_url)`: Executes greeting flow
   - Calls YouTube API via Gateway
-  - Detects OAuth elicitation (error code -32001)
+  - Detects OAuth elicitation
   - Extracts authorization URL from error response
   - Returns greeting or "OAuth authorization pending"
 
 **Implementation**:
 ```python
-def call_gateway_tool(gateway_url, bearer_token, tool_name, arguments, return_url, force_auth=False):
+def call_gateway_tool(gateway_url, bearer_token, tool_name, arguments):
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {bearer_token}",
         "MCP-Protocol-Version": "2025-11-25"  # Required for OAuth elicitation
-    }
-    
-    _meta = {
-        "aws.bedrock-agentcore.gateway/credentialProviderConfiguration": {
-            "oauthCredentialProvider": {
-                "returnUrl": return_url,
-                "forceAuthentication": force_auth
-            }
-        }
     }
     
     payload = {
@@ -261,8 +251,9 @@ def call_gateway_tool(gateway_url, bearer_token, tool_name, arguments, return_ur
         "method": "tools/call",
         "params": {
             "name": tool_name,
-            "arguments": arguments,
-            "_meta": _meta
+            "arguments": arguments
+            # ⚠️ NO _meta field - causes ELB 403 errors
+            # OAuth configuration comes from Gateway Target's credentialProviderConfigurations
         }
     }
     
@@ -274,10 +265,15 @@ def call_gateway_tool(gateway_url, bearer_token, tool_name, arguments, return_ur
 
 **OAuth Elicitation Detection**:
 ```python
-if "error" in result and result["error"].get("code") == -32001:
-    auth_url = result["error"]["data"]["authorizationUrl"]
+if "error" in result and result["error"].get("code") == -32042:
+    elicitations = result["error"]["data"]["elicitations"]
+    auth_url = elicitations[0]["authorizationUrl"]
+    session_uri = elicitations[0]["sessionUri"]
     # Display URL to user
 ```
+
+**Critical Implementation Notes**:
+- **DO NOT include `_meta` field**: Causes ELB 403 errors before Gateway calls
 
 ### 2. OAuth2 Callback Server (`oauth2_callback_server.py`)
 
@@ -504,7 +500,7 @@ gateway_url = gateway_response["gatewayUrl"]
 # Link Gateway with OAuth Provider
 target_response = control_client.create_gateway_target(
     gatewayIdentifier=gateway_id,
-    name="youtube-target",
+    name="YouTubeTarget",
     targetConfiguration={
         "mcp": {
             "openApiSchema": {
@@ -521,7 +517,10 @@ target_response = control_client.create_gateway_target(
                                      "schema": {"type": "string"}},
                                     {"name": "mine", "in": "query", 
                                      "schema": {"type": "boolean"}}
-                                ]
+                                ],
+                                "responses": {  # ⚠️ Required: Target fails without responses
+                                    "200": {"description": "Successful response"}
+                                }
                             }
                         },
                         "/subscriptions": {
@@ -534,7 +533,10 @@ target_response = control_client.create_gateway_target(
                                      "schema": {"type": "boolean"}},
                                     {"name": "maxResults", "in": "query",
                                      "schema": {"type": "integer"}}
-                                ]
+                                ],
+                                "responses": {  # ⚠️ Required: Target fails without responses
+                                    "200": {"description": "Successful response"}
+                                }
                             }
                         }
                     }
@@ -683,6 +685,17 @@ identity_client.complete_resource_token_auth(session_id, access_token)
 ```bash
 uv run python construct.py --cleanup
 ```
+
+**Critical Cleanup Order**:
+1. Delete Gateway Target first (cannot delete gateway with associated targets)
+2. Wait 5-10 seconds before deleting Gateway (allow target deletion to propagate)
+3. Delete Gateway
+4. Delete OAuth Provider (use `name` parameter, not `providerArn`)
+5. Delete Workload Identity (use `name` parameter, not `workloadIdentityArn`)
+6. Delete Cognito resources
+7. Delete IAM role
+
+**Implementation Note**: OAuth provider and workload identity deletion use `name` parameter in API calls, not ARN parameters.
 
 **Partial Failure Recovery**:
 1. Check `config.json` for successfully created resources
