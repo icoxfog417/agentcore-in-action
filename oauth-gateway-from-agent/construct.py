@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Construct AWS resources for MCP Server with OAuth Gateway.
 
-Uses CloudFormation for infrastructure (S3, CloudFront, Cognito, IAM)
+Uses CloudFormation for infrastructure (CloudFront, Lambda, DynamoDB, Cognito, IAM)
 and boto3 for AgentCore resources (no CFN support yet).
 
 Usage:
@@ -25,7 +25,6 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 STACK_NAME = "mcp-oauth-gateway"
 CFN_STACK_NAME = f"{STACK_NAME}-infra"
-LOCAL_CALLBACK_URL = "http://localhost:8765/oauth2/callback"
 
 
 def main():
@@ -42,6 +41,11 @@ def main():
     print(f"  ✓ Stack deployed: {CFN_STACK_NAME}")
     for key, value in cfn_outputs.items():
         print(f"    {key}: {value[:60]}..." if len(value) > 60 else f"    {key}: {value}")
+
+    # Step 1b: Create and attach boto3 layer to Lambda
+    print("\nStep 1b: Creating boto3 layer for Lambda...")
+    create_boto3_layer()
+    print("  ✓ boto3 layer attached to Lambda")
 
     # Step 2: AgentCore Resources (no CFN support)
     print("\nStep 2: Creating AgentCore Resources...")
@@ -65,20 +69,21 @@ def main():
     config.update(gateway_config)
     print(f"    ✓ Gateway ID: {gateway_config['gateway_id']}")
 
-    # 2d: Gateway Target
+    # 2d: Gateway Target (use CloudFront callback URL for session binding)
     print("  2d: Creating Gateway Target...")
+    callback_url = cfn_outputs["OAuthCallbackUrl"]
     target_config = create_gateway_target(
         gateway_config["gateway_id"],
         outbound_config["outbound_provider_arn"],
-        LOCAL_CALLBACK_URL  # Use local callback for session binding
+        callback_url
     )
     config.update(target_config)
     print(f"    ✓ Target ID: {target_config['target_id']}")
 
-    # Add Cognito callback URL
+    # Add callback URLs to config
     cognito_domain = cfn_outputs.get("InboundCognitoDomain", "")
     config["inbound_callback_url"] = f"https://{cognito_domain}.auth.{REGION}.amazoncognito.com/oauth2/idpresponse"
-    config["local_callback_url"] = LOCAL_CALLBACK_URL
+    config["oauth_callback_url"] = callback_url  # CloudFront URL for session binding
 
     # Save config
     config_path = Path(__file__).parent / "config.json"
@@ -136,6 +141,61 @@ def deploy_cfn_stack() -> dict:
 
     response = cfn.describe_stacks(StackName=CFN_STACK_NAME)
     return {o["OutputKey"]: o["OutputValue"] for o in response["Stacks"][0].get("Outputs", [])}
+
+
+def create_boto3_layer():
+    """Create and attach boto3 layer to Lambda for bedrock-agentcore support."""
+    import io
+    import subprocess
+    import tempfile
+    import zipfile
+
+    lambda_client = boto3.client("lambda", region_name=REGION)
+    layer_name = f"{STACK_NAME}-boto3-layer"
+    function_name = f"{STACK_NAME}-oauth-callback"
+
+    # Check if layer already exists and is attached
+    try:
+        func = lambda_client.get_function(FunctionName=function_name)
+        layers = func.get("Configuration", {}).get("Layers", [])
+        if any(layer_name in layer.get("Arn", "") for layer in layers):
+            print("  ✓ boto3 layer already attached")
+            return
+    except Exception:
+        pass
+
+    # Create layer zip with latest boto3
+    with tempfile.TemporaryDirectory() as tmpdir:
+        python_dir = Path(tmpdir) / "python"
+        python_dir.mkdir()
+        subprocess.run(
+            ["pip", "install", "boto3", "-t", str(python_dir), "-q", "--upgrade"],
+            check=True, capture_output=True
+        )
+
+        # Create zip in memory
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for file_path in python_dir.rglob("*"):
+                if file_path.is_file():
+                    arcname = str(file_path.relative_to(tmpdir))
+                    zf.write(file_path, arcname)
+        zip_buffer.seek(0)
+
+        # Publish layer
+        resp = lambda_client.publish_layer_version(
+            LayerName=layer_name,
+            Description="Latest boto3 with bedrock-agentcore support",
+            Content={"ZipFile": zip_buffer.read()},
+            CompatibleRuntimes=["python3.12"],
+        )
+        layer_arn = resp["LayerVersionArn"]
+
+    # Attach layer to Lambda function
+    lambda_client.update_function_configuration(
+        FunctionName=function_name,
+        Layers=[layer_arn]
+    )
 
 
 def create_inbound_cognito_provider(cfn_outputs: dict) -> dict:

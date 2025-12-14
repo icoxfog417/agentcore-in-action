@@ -11,71 +11,183 @@ Parameters:
   GoogleClientSecret:
     Type: String
     NoEcho: true
-  EnableLocalDev:
-    Type: String
-    Default: 'true'
-    AllowedValues: ['true', 'false']
-    Description: Enable localhost callback URLs for development
-
-Conditions:
-  IncludeLocalhost: !Equals [!Ref EnableLocalDev, 'true']
 
 Resources:
-  # S3 Bucket for OAuth callback page
-  CallbackBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub '${StackName}-callback-${AWS::AccountId}-${AWS::Region}'
+  # =============================================================================
+  # Outbound OAuth Callback Infrastructure (CloudFront -> Lambda -> DynamoDB)
+  # Replaces local server for production-ready session binding
+  # =============================================================================
 
-  CallbackBucketPolicy:
-    Type: AWS::S3::BucketPolicy
+  # DynamoDB table for OAuth session storage
+  OAuthSessionTable:
+    Type: AWS::DynamoDB::Table
     Properties:
-      Bucket: !Ref CallbackBucket
-      PolicyDocument:
+      TableName: !Sub '${StackName}-oauth-sessions'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Lambda execution role
+  CallbackLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackName}-callback-lambda-role'
+      AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
-              Service: cloudfront.amazonaws.com
-            Action: s3:GetObject
-            Resource: !Sub '${CallbackBucket.Arn}/*'
-            Condition:
-              StringEquals:
-                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CallbackDistribution}'
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: dynamodb-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt OAuthSessionTable.Arn
+        - PolicyName: agentcore-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:CompleteResourceTokenAuth
+                Resource: '*'
 
-  # CloudFront OAC
-  CallbackOAC:
+  # Lambda function for OAuth callback - completes session binding
+  CallbackLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${StackName}-oauth-callback'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt CallbackLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OAuthSessionTable
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          agentcore = boto3.client('bedrock-agentcore')
+
+          def handler(event, context):
+              qs = event.get('queryStringParameters') or {}
+              session_id = qs.get('session_id')
+
+              if not session_id:
+                  return {'statusCode': 400, 'headers': {'Content-Type': 'text/html'},
+                          'body': '<h1>Error</h1><p>Missing session_id</p>'}
+
+              # Get user_id from DynamoDB (keyed by session_id)
+              resp = table.get_item(Key={'session_id': session_id})
+              if 'Item' not in resp:
+                  return {'statusCode': 400, 'headers': {'Content-Type': 'text/html'},
+                          'body': f'<h1>Error</h1><p>Unknown session: {session_id[:50]}...</p>'}
+
+              user_id = resp['Item'].get('user_id')
+              if not user_id:
+                  return {'statusCode': 400, 'headers': {'Content-Type': 'text/html'},
+                          'body': '<h1>Error</h1><p>Missing user_id</p>'}
+
+              # Complete session binding with userId
+              try:
+                  agentcore.complete_resource_token_auth(
+                      sessionUri=session_id,
+                      userIdentifier={'userId': user_id}
+                  )
+              except Exception as e:
+                  table.update_item(
+                      Key={'session_id': session_id},
+                      UpdateExpression='SET #s = :s, #e = :e',
+                      ExpressionAttributeNames={'#s': 'status', '#e': 'error'},
+                      ExpressionAttributeValues={':s': 'FAILED', ':e': str(e)}
+                  )
+                  return {'statusCode': 500, 'headers': {'Content-Type': 'text/html'},
+                          'body': f'<h1>Error</h1><p>{str(e)}</p>'}
+
+              # Mark as complete
+              table.update_item(
+                  Key={'session_id': session_id},
+                  UpdateExpression='SET #s = :s',
+                  ExpressionAttributeNames={'#s': 'status'},
+                  ExpressionAttributeValues={':s': 'COMPLETE'}
+              )
+
+              return {'statusCode': 200, 'headers': {'Content-Type': 'text/html'},
+                      'body': '<h1>Authorization Complete!</h1><p>You can close this window.</p>'}
+
+  # Lambda Function URL (origin for CloudFront)
+  CallbackLambdaUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: AWS_IAM
+      TargetFunctionArn: !Ref CallbackLambda
+
+  # OAC for Lambda - restricts access to CloudFront only
+  LambdaOAC:
     Type: AWS::CloudFront::OriginAccessControl
     Properties:
       OriginAccessControlConfig:
-        Name: !Sub '${StackName}-oac'
-        OriginAccessControlOriginType: s3
+        Name: !Sub '${StackName}-lambda-oac'
+        OriginAccessControlOriginType: lambda
         SigningBehavior: always
         SigningProtocol: sigv4
 
-  # CloudFront Distribution
+  # Permission for CloudFront to invoke Lambda via OAC
+  CallbackLambdaCloudFrontPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CallbackLambda
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CallbackDistribution}'
+      FunctionUrlAuthType: AWS_IAM
+
+  # CloudFront Distribution -> Lambda Function URL (via OAC)
+  # Provides WAF capability, DDoS protection, and restricts Lambda access
   CallbackDistribution:
     Type: AWS::CloudFront::Distribution
     Properties:
       DistributionConfig:
         Enabled: true
-        DefaultRootObject: callback.html
         Comment: !Sub '${StackName} OAuth callback'
         Origins:
-          - Id: S3Origin
-            DomainName: !GetAtt CallbackBucket.RegionalDomainName
-            S3OriginConfig:
-              OriginAccessIdentity: ''
-            OriginAccessControlId: !Ref CallbackOAC
+          - Id: LambdaOrigin
+            DomainName: !Select [2, !Split ['/', !GetAtt CallbackLambdaUrl.FunctionUrl]]
+            OriginAccessControlId: !Ref LambdaOAC
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
         DefaultCacheBehavior:
-          TargetOriginId: S3Origin
+          TargetOriginId: LambdaOrigin
           ViewerProtocolPolicy: redirect-to-https
           AllowedMethods: [GET, HEAD]
           CachedMethods: [GET, HEAD]
-          ForwardedValues:
-            QueryString: false
-            Cookies:
-              Forward: none
+          # Managed policies: CachingDisabled + AllViewerExceptHostHeader
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+  # =============================================================================
+  # Inbound Authentication Infrastructure (Cognito with Google Federation)
+  # =============================================================================
 
   # Cognito User Pool
   UserPool:
@@ -116,22 +228,18 @@ Resources:
       UserPoolId: !Ref UserPool
       GenerateSecret: true
       SupportedIdentityProviders: [Google, COGNITO]
-      CallbackURLs: !If
-        - IncludeLocalhost
-        - - !Sub 'https://${CallbackDistribution.DomainName}/callback_inbound.html'
-          - 'http://localhost:8080/callback'
-          - !Sub 'https://bedrock-agentcore.${AWS::Region}.amazonaws.com/identities/oauth2/callback'
-        - - !Sub 'https://${CallbackDistribution.DomainName}/callback_inbound.html'
-          - !Sub 'https://bedrock-agentcore.${AWS::Region}.amazonaws.com/identities/oauth2/callback'
-      LogoutURLs: !If
-        - IncludeLocalhost
-        - - 'http://localhost:8080/logout'
-        - - !Sub 'https://${CallbackDistribution.DomainName}/logout.html'
+      CallbackURLs:
+        - !Sub 'https://bedrock-agentcore.${AWS::Region}.amazonaws.com/identities/oauth2/callback'
+      LogoutURLs:
+        - !Sub 'https://${CallbackDistribution.DomainName}/'
       AllowedOAuthFlows: [code]
       AllowedOAuthScopes: [openid, email, profile]
       AllowedOAuthFlowsUserPoolClient: true
 
+  # =============================================================================
   # Gateway Execution Role
+  # =============================================================================
+
   GatewayRole:
     Type: AWS::IAM::Role
     Properties:
@@ -158,25 +266,26 @@ Resources:
                 Resource: '*'
 
 Outputs:
-  CallbackInboundUrl:
-    Value: !Sub 'https://${CallbackDistribution.DomainName}/callback_inbound.html'
-    Description: Callback URL for Cognito inbound authentication
-  CallbackOutboundUrl:
-    Value: !Sub 'https://${CallbackDistribution.DomainName}/callback_outbound.html'
-    Description: Callback URL for Token Vault outbound authorization
-  BucketName:
-    Value: !Ref CallbackBucket
+  # Outbound OAuth Callback
+  OAuthCallbackUrl:
+    Value: !Sub 'https://${CallbackDistribution.DomainName}/'
+    Description: CloudFront URL for OAuth callback (register in Google OAuth app)
+  OAuthSessionTableName:
+    Value: !Ref OAuthSessionTable
+    Description: DynamoDB table for OAuth session storage
   DistributionId:
     Value: !Ref CallbackDistribution
+
+  # Inbound Authentication (Cognito)
   InboundUserPoolId:
     Value: !Ref UserPool
   InboundClientId:
     Value: !Ref UserPoolClient
   InboundDiscoveryUrl:
     Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration'
-  InboundHostedUiUrl:
-    Value: !Sub 'https://${StackName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=code&scope=openid+email+profile&redirect_uri=https://${CallbackDistribution.DomainName}/callback_inbound.html'
   InboundCognitoDomain:
     Value: !Sub '${StackName}-${AWS::AccountId}'
+
+  # Gateway
   GatewayRoleArn:
     Value: !GetAtt GatewayRole.Arn
