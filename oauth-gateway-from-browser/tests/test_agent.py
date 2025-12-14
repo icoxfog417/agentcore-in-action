@@ -3,7 +3,7 @@
 
 def test_call_gateway_tool():
     """Test making raw JSON-RPC call with OAuth _meta"""
-    from say_hello_to_authorized_customer.agent import call_gateway_tool
+    from oauth_gateway_from_browser.agent import call_gateway_tool
     
     assert callable(call_gateway_tool)
 
@@ -31,7 +31,7 @@ def test_detect_oauth_elicitation():
 
 def test_greet_user():
     """Test executing greeting flow with YouTube data"""
-    from say_hello_to_authorized_customer.agent import greet_user
+    from oauth_gateway_from_browser.agent import greet_user
     
     assert callable(greet_user)
 

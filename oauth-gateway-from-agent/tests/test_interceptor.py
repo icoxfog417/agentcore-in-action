@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from mcp_server_with_oauth_gateway.interceptor import (
+from oauth_gateway_from_agent.interceptor import (
     decode_jwt_payload,
     extract_google_user_id,
     _inject_token_response,

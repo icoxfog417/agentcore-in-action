@@ -211,10 +211,34 @@ client.create_gateway(
             "searchType": "SEMANTIC"
         }
     },
+    interceptorConfigurations=[{  # Note: plural
+        "interceptor": {"lambda": {"arn": lambda_arn}},  # Note: "arn" not "lambdaArn"
+        "interceptionPoints": ["REQUEST"],  # Required
+    }],
     exceptionLevel="DEBUG",  # Helps with troubleshooting
     # ... other params
 )
 ```
+
+### Gateway Status Checking
+Use `list_gateways` instead of `get_gateway` for idempotent operations (avoids permission issues):
+
+```python
+# Check if gateway exists and get status
+existing = client.list_gateways(maxResults=100)
+for gw in existing.get("items", []):
+    if gw.get("name") == gateway_name:
+        gateway_id = gw["gatewayId"]
+        status = gw.get("status")  # CREATING, READY, FAILED
+        break
+```
+
+### Exception Handling
+Different operations throw different exceptions for "already exists":
+- `create_gateway`: throws `ConflictException`
+- `create_oauth2_credential_provider`: throws `ValidationException` (not ConflictException)
+
+Handle both when implementing idempotent resource creation.
 
 ### Response Field Names
 OAuth provider responses use different field names depending on the operation:

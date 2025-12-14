@@ -108,21 +108,21 @@ Resources:
         username: sub
 
   # Cognito App Client
-  # Used when user signs in via Cognito Hosted UI with Google federation
-  # Callback URL points to callback_inbound.html (inbound auth completion)
   UserPoolClient:
     Type: AWS::Cognito::UserPoolClient
     DependsOn: GoogleIdentityProvider
     Properties:
       ClientName: !Sub '${StackName}-client'
       UserPoolId: !Ref UserPool
-      GenerateSecret: false
+      GenerateSecret: true
       SupportedIdentityProviders: [Google, COGNITO]
       CallbackURLs: !If
         - IncludeLocalhost
         - - !Sub 'https://${CallbackDistribution.DomainName}/callback_inbound.html'
           - 'http://localhost:8080/callback'
+          - !Sub 'https://bedrock-agentcore.${AWS::Region}.amazonaws.com/identities/oauth2/callback'
         - - !Sub 'https://${CallbackDistribution.DomainName}/callback_inbound.html'
+          - !Sub 'https://bedrock-agentcore.${AWS::Region}.amazonaws.com/identities/oauth2/callback'
       LogoutURLs: !If
         - IncludeLocalhost
         - - 'http://localhost:8080/logout'
@@ -130,57 +130,6 @@ Resources:
       AllowedOAuthFlows: [code]
       AllowedOAuthScopes: [openid, email, profile]
       AllowedOAuthFlowsUserPoolClient: true
-
-  # Lambda Execution Role
-  InterceptorRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub '${StackName}-interceptor-role'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: agentcore-identity
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: bedrock-agentcore:GetResourceOauth2Token
-                Resource: '*'
-
-  # Interceptor Lambda Function
-  InterceptorFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub '${StackName}-interceptor'
-      Runtime: python3.12
-      Handler: interceptor.handler
-      Role: !GetAtt InterceptorRole.Arn
-      Timeout: 30
-      MemorySize: 256
-      Code:
-        ZipFile: |
-          # Placeholder - will be updated by construct.py
-          def handler(event, context):
-              return {"statusCode": 200}
-      Environment:
-        Variables:
-          AWS_REGION_NAME: !Ref AWS::Region
-          OAUTH_PROVIDER_ARN: ''
-
-  # Lambda Permission for AgentCore Gateway
-  InterceptorPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref InterceptorFunction
-      Action: lambda:InvokeFunction
-      Principal: bedrock-agentcore.amazonaws.com
 
   # Gateway Execution Role
   GatewayRole:
@@ -195,13 +144,18 @@ Resources:
               Service: bedrock-agentcore.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: lambda-invoke
+        - PolicyName: workload-identity
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: lambda:InvokeFunction
-                Resource: !GetAtt InterceptorFunction.Arn
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                  - bedrock-agentcore:GetResourceOAuth2Token
+                Resource: '*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: '*'
 
 Outputs:
   CallbackInboundUrl:
@@ -214,17 +168,15 @@ Outputs:
     Value: !Ref CallbackBucket
   DistributionId:
     Value: !Ref CallbackDistribution
-  UserPoolId:
+  InboundUserPoolId:
     Value: !Ref UserPool
-  ClientId:
+  InboundClientId:
     Value: !Ref UserPoolClient
-  DiscoveryUrl:
+  InboundDiscoveryUrl:
     Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration'
-  HostedUiUrl:
+  InboundHostedUiUrl:
     Value: !Sub 'https://${StackName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=code&scope=openid+email+profile&redirect_uri=https://${CallbackDistribution.DomainName}/callback_inbound.html'
-  CognitoDomain:
+  InboundCognitoDomain:
     Value: !Sub '${StackName}-${AWS::AccountId}'
-  InterceptorArn:
-    Value: !GetAtt InterceptorFunction.Arn
   GatewayRoleArn:
     Value: !GetAtt GatewayRole.Arn

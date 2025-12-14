@@ -1,4 +1,4 @@
-# Test Suite for MCP Server with OAuth Gateway
+# Test Suite for Secure MCP with OAuth Gateway
 
 ## Overview
 - Total: 9 | Passing: 9 | Failing: 0
@@ -18,18 +18,18 @@
 
 ### Interceptor Lambda
 - test_decode_valid_jwt
-  - Spec: README.md > Specifications > Interceptor Lambda > Input
+  - Spec: README.md > Specifications > Interceptor Lambda > Logic
   - Purpose: Decode JWT payload correctly
   - Status: ✅
 
 - test_decode_invalid_jwt_format
-  - Spec: README.md > Specifications > Interceptor Lambda > Input
+  - Spec: README.md > Specifications > Interceptor Lambda > Logic
   - Purpose: Reject malformed JWT tokens
   - Status: ✅
 
 - test_extract_from_identities
   - Spec: README.md > Specifications > Interceptor Lambda > Logic
-  - Purpose: Extract Google user ID from Cognito identities claim
+  - Purpose: Extract Google user ID from JWT sub claim
   - Status: ✅
 
 - test_no_identities_claim
@@ -51,6 +51,10 @@
   - Spec: README.md > Specifications > Interceptor Lambda > Output (no token)
   - Purpose: Return transformedGatewayResponse with 401 and authorizationUrl
   - Status: ✅
+
+## Todo (Priority)
+- [ ] test_gateway_jwt_validation (Medium) - Gateway validates Google OIDC JWT
+- [ ] test_outbound_token_retrieval (Medium) - Interceptor calls GetResourceOauth2Token
 
 ## Run
 ```bash
