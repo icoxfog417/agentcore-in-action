@@ -19,6 +19,7 @@ Bridge the gap between exploration and integration. While Jupyter Notebook examp
 | Example | Description | AgentCore Features |
 |---------|-------------|-------------------|
 | [say-hello-to-authorized-customer](./say-hello-to-authorized-customer/) | Personalized greetings using user's YouTube data via OAuth 2.0 | Identity, Gateway, OAuth 2.0 Authorization Code Grant |
+| [mcp-server-with-oauth-gateway](./mcp-server-with-oauth-gateway/) | MCP server that accesses GitHub API through AgentCore Gateway with OAuth, connected via mcp-proxy-for-aws | Runtime, Gateway, Identity, OAuth 2.0, SigV4 |
 
 See each example's README.md for detailed documentation, architecture diagrams, and security considerations.
 
