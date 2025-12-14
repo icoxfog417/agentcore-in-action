@@ -88,7 +88,7 @@ class OAuth2CallbackServer:
         print(f"✓ Token (first 50 chars): {self.access_token[:50]}...")
         
         # Trigger OAuth elicitation
-        from say_hello_to_authorized_customer.agent import greet_user
+        from oauth_gateway_from_browser.agent import greet_user
         result = greet_user(self.config["gateway_url"], self.access_token, "http://localhost:8080/oauth2/callback")
         
         if result["status"] == "oauth_required":
@@ -122,7 +122,7 @@ class OAuth2CallbackServer:
         print("[DEBUG] Session binding complete, retrying tool call...")
         
         # Retry greeting (without _meta - session is already bound)
-        from say_hello_to_authorized_customer.agent import greet_user
+        from oauth_gateway_from_browser.agent import greet_user
         result = greet_user(self.config["gateway_url"], self.access_token)
         
         print(f"[DEBUG] Result: {result}")

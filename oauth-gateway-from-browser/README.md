@@ -20,7 +20,7 @@ This example demonstrates how to build an agent that greets users with personali
 
 1. Navigate to the example directory:
    ```bash
-   cd say-hello-to-authorized-customer
+   cd oauth-gateway-from-browser
    ```
 
 2. Copy environment variables:
@@ -219,7 +219,7 @@ sequenceDiagram
 
 ## Specifications
 
-### 1. Agent (`say_hello_to_authorized_customer/agent.py`)
+### 1. Agent (`oauth_gateway_from_browser/agent.py`)
 
 **Purpose**: Core agent logic that makes raw JSON-RPC calls to Gateway with OAuth configuration.
 

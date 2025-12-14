@@ -167,4 +167,82 @@ See `.example/sample-amazon-bedrock-agentcore-onboarding` for implementations:
 - `03_multi_agent/`: Complex multi-agent workflows
 
 Each demonstrates proper structure, documentation, and security practices.
-d
+
+## AgentCore API Guidelines
+
+### Boto3 Client Selection
+AgentCore uses two separate boto3 clients for different operations:
+
+| Client | Use For |
+|--------|---------|
+| `bedrock-agentcore-control` | Control plane: create/delete/get gateways, targets, OAuth providers, workload identities |
+| `bedrock-agentcore` | Data plane: runtime operations, invoking agents |
+
+**Common mistake**: Using `bedrock-agentcore` for control plane operations causes API errors.
+
+### Gateway Target Configuration
+When creating gateway targets with OAuth credential providers:
+
+```python
+# Required fields for AUTHORIZATION_CODE grant type
+credentialProviderConfigurations=[{
+    "credentialProviderType": "OAUTH",
+    "credentialProvider": {
+        "oauthCredentialProvider": {
+            "providerArn": provider_arn,
+            "grantType": "AUTHORIZATION_CODE",
+            "defaultReturnUrl": callback_url,  # REQUIRED - often missed
+            "scopes": ["..."]
+        }
+    }
+}]
+```
+
+### Gateway Configuration
+Include protocol configuration and exception level for better debugging:
+
+```python
+client.create_gateway(
+    name=gateway_name,
+    protocolType="MCP",
+    protocolConfiguration={
+        "mcp": {
+            "supportedVersions": ["2025-11-25"],
+            "searchType": "SEMANTIC"
+        }
+    },
+    interceptorConfigurations=[{  # Note: plural
+        "interceptor": {"lambda": {"arn": lambda_arn}},  # Note: "arn" not "lambdaArn"
+        "interceptionPoints": ["REQUEST"],  # Required
+    }],
+    exceptionLevel="DEBUG",  # Helps with troubleshooting
+    # ... other params
+)
+```
+
+### Gateway Status Checking
+Use `list_gateways` instead of `get_gateway` for idempotent operations (avoids permission issues):
+
+```python
+# Check if gateway exists and get status
+existing = client.list_gateways(maxResults=100)
+for gw in existing.get("items", []):
+    if gw.get("name") == gateway_name:
+        gateway_id = gw["gatewayId"]
+        status = gw.get("status")  # CREATING, READY, FAILED
+        break
+```
+
+### Exception Handling
+Different operations throw different exceptions for "already exists":
+- `create_gateway`: throws `ConflictException`
+- `create_oauth2_credential_provider`: throws `ValidationException` (not ConflictException)
+
+Handle both when implementing idempotent resource creation.
+
+### Response Field Names
+OAuth provider responses use different field names depending on the operation:
+- `create_oauth2_credential_provider`: returns `credentialProviderArn`
+- `get_oauth2_credential_provider`: may return `oauth2CredentialProviderArn`
+
+Handle both cases when extracting ARNs from responses.

@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: MCP Server with OAuth Gateway - Infrastructure Stack
+
+Parameters:
+  StackName:
+    Type: String
+    Default: mcp-oauth-gateway
+  GoogleClientId:
+    Type: String
+    NoEcho: true
+  GoogleClientSecret:
+    Type: String
+    NoEcho: true
+  EnableLocalDev:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable localhost callback URLs for development
+
+Conditions:
+  IncludeLocalhost: !Equals [!Ref EnableLocalDev, 'true']
+
+Resources:
+  # S3 Bucket for OAuth callback page
+  CallbackBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${StackName}-callback-${AWS::AccountId}-${AWS::Region}'
+
+  CallbackBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CallbackBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${CallbackBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CallbackDistribution}'
+
+  # CloudFront OAC
+  CallbackOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${StackName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # CloudFront Distribution
+  CallbackDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: callback.html
+        Comment: !Sub '${StackName} OAuth callback'
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt CallbackBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !Ref CallbackOAC
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${StackName}-pool'
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+
+  # Cognito User Pool Domain
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub '${StackName}-${AWS::AccountId}'
+      UserPoolId: !Ref UserPool
+
+  # Cognito Google Identity Provider
+  GoogleIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Properties:
+      UserPoolId: !Ref UserPool
+      ProviderName: Google
+      ProviderType: Google
+      ProviderDetails:
+        client_id: !Ref GoogleClientId
+        client_secret: !Ref GoogleClientSecret
+        authorize_scopes: 'openid email profile'
+      AttributeMapping:
+        email: email
+        username: sub
+
+  # Cognito App Client
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: GoogleIdentityProvider
+    Properties:
+      ClientName: !Sub '${StackName}-client'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      SupportedIdentityProviders: [Google, COGNITO]
+      CallbackURLs: !If
+        - IncludeLocalhost
+        - - !Sub 'https://${CallbackDistribution.DomainName}/callback_inbound.html'
+          - 'http://localhost:8080/callback'
+          - !Sub 'https://bedrock-agentcore.${AWS::Region}.amazonaws.com/identities/oauth2/callback'
+        - - !Sub 'https://${CallbackDistribution.DomainName}/callback_inbound.html'
+          - !Sub 'https://bedrock-agentcore.${AWS::Region}.amazonaws.com/identities/oauth2/callback'
+      LogoutURLs: !If
+        - IncludeLocalhost
+        - - 'http://localhost:8080/logout'
+        - - !Sub 'https://${CallbackDistribution.DomainName}/logout.html'
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      AllowedOAuthFlowsUserPoolClient: true
+
+  # Gateway Execution Role
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackName}-gateway-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: workload-identity
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                  - bedrock-agentcore:GetResourceOAuth2Token
+                Resource: '*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: '*'
+
+Outputs:
+  CallbackInboundUrl:
+    Value: !Sub 'https://${CallbackDistribution.DomainName}/callback_inbound.html'
+    Description: Callback URL for Cognito inbound authentication
+  CallbackOutboundUrl:
+    Value: !Sub 'https://${CallbackDistribution.DomainName}/callback_outbound.html'
+    Description: Callback URL for Token Vault outbound authorization
+  BucketName:
+    Value: !Ref CallbackBucket
+  DistributionId:
+    Value: !Ref CallbackDistribution
+  InboundUserPoolId:
+    Value: !Ref UserPool
+  InboundClientId:
+    Value: !Ref UserPoolClient
+  InboundDiscoveryUrl:
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration'
+  InboundHostedUiUrl:
+    Value: !Sub 'https://${StackName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=code&scope=openid+email+profile&redirect_uri=https://${CallbackDistribution.DomainName}/callback_inbound.html'
+  InboundCognitoDomain:
+    Value: !Sub '${StackName}-${AWS::AccountId}'
+  GatewayRoleArn:
+    Value: !GetAtt GatewayRole.Arn
