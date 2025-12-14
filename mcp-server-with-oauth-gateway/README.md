@@ -2,155 +2,126 @@
 
 ## Overview
 
-This example demonstrates how to build an MCP server that interacts with 3rd party APIs through AgentCore Gateway using OAuth authentication. The server runs on AgentCore Runtime and is accessed by clients via `mcp-proxy-for-aws` using SigV4 authentication.
+This example demonstrates an **MCP server implementation that connects to AgentCore Gateway** with both **inbound OAuth authentication** (user identity) and **outbound OAuth authorization** (API access).
 
-**Architecture Flow:**
+The MCP server exposes YouTube API tools to clients, while AgentCore Gateway handles:
+- **Inbound Auth**: Validates user identity via Cognito JWT (federated with Google)
+- **Outbound Auth**: Retrieves user-specific Google API tokens from Token Vault
+
+**Key Concept: Single Google Identity, Dual Purpose**
+- **Inbound**: User signs in with Google via Cognito → identifies WHO the user is
+- **Outbound**: Same user's Google token from Token Vault → authorizes WHAT they can access
+
+**Use Case**: Building MCP servers that securely access third-party APIs on behalf of authenticated users, with seamless single sign-on using Google for both authentication and authorization.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Client
+        U[User/MCP Client]
+    end
+
+    subgraph Cognito[Amazon Cognito]
+        CUP[User Pool]
+        GF[Google Federation]
+    end
+
+    subgraph Gateway[AgentCore Gateway]
+        IN[Inbound Auth<br/>CUSTOM_JWT]
+        INT[Interceptor<br/>Lambda]
+        OUT[Outbound Call]
+    end
+
+    subgraph Identity[AgentCore Identity]
+        TV[Token Vault]
+        OP[OAuth Provider<br/>Google]
+    end
+
+    subgraph External
+        YT[YouTube API]
+    end
+
+    U -->|1. Sign in| CUP
+    CUP -->|2. Federate| GF
+    GF -->|3. JWT with<br/>Google identity| U
+    U -->|4. MCP call + JWT| IN
+    IN -->|5. Validate JWT| IN
+    IN -->|6. Pass claims| INT
+    INT -->|7. Get token<br/>for user| TV
+    TV -->|8. Google token| INT
+    INT -->|9. Inject header| OUT
+    OUT -->|10. API call| YT
+    YT -->|11. Response| U
 ```
-Client (Claude Desktop)
-  ↓ MCP Protocol
-mcp-proxy-for-aws
-  ↓ SigV4 Authentication
-MCP Server (AgentCore Runtime)
-  ↓ Bearer Token (from SigV4)
-AgentCore Gateway
-  ↓ OAuth (via AgentCore Identity)
-3rd Party API (GitHub)
-```
 
-**Use Case**: Enabling MCP tools to securely access external APIs on behalf of authenticated users without exposing credentials, while running the MCP server on AWS infrastructure.
+## Prerequisites
 
-**Prerequisites:**
 - AWS account with AgentCore access
-- GitHub OAuth App credentials
-  - Create at: https://github.com/settings/developers
-  - Note down Client ID and Client Secret
+- Google OAuth App credentials (https://console.cloud.google.com/apis/credentials)
 - Python 3.10+
 - AWS credentials configured
 - `uv` for dependency management
 
 ## Quick Start
 
-### 1. Setup Environment
-
 ```bash
 cd mcp-server-with-oauth-gateway
 cp .env.example .env
-```
-
-Edit `.env` and configure:
-- `AWS_REGION`: Your AWS region (default: us-east-1)
-- `GITHUB_CLIENT_ID`: From GitHub OAuth App
-- `GITHUB_CLIENT_SECRET`: From GitHub OAuth App
-- `OAUTH_CALLBACK_URL`: OAuth callback URL (default: http://localhost:8080/oauth/callback)
-
-### 2. Build Infrastructure
-
-```bash
+# Edit .env with GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET
 uv run python construct.py
+# Register callback URLs in Google OAuth App
+uv run python main.py
 ```
-
-This creates:
-- IAM roles for Gateway and Runtime
-- Workload Identity for OAuth token storage
-- OAuth credential provider for GitHub
-- Gateway with MCP protocol support
-- Gateway Target with GitHub API specification
-
-**Important:** The script outputs an `oauth_callback_url`. You must register this URL in your GitHub OAuth App:
-1. Go to https://github.com/settings/developers
-2. Select your OAuth App
-3. Add the `oauth_callback_url` to "Authorization callback URL"
-4. Save changes
-
-Configuration is saved to `config.json`.
-
-### 3. Start OAuth Callback Server
-
-In a separate terminal:
-
-```bash
-uv run python main.py --mode oauth-callback
-```
-
-This starts a web server on port 8080 to handle OAuth callbacks.
-
-### 4. Run MCP Server
-
-```bash
-uv run python main.py --mode mcp
-```
-
-The server exposes two MCP tools:
-- `get_user_repos`: Get authenticated user's GitHub repositories
-- `get_user_profile`: Get authenticated user's GitHub profile
-
-### 5. Connect via mcp-proxy-for-aws
-
-Configure your MCP client (e.g., Claude Desktop) to connect via mcp-proxy-for-aws:
-
-```json
-{
-  "mcpServers": {
-    "github-mcp": {
-      "command": "mcp-proxy-for-aws",
-      "args": [
-        "--region", "us-east-1",
-        "--runtime-arn", "arn:aws:bedrock-agentcore:...:runtime/...",
-        "--"
-      ]
-    }
-  }
-}
-```
-
-Replace the `runtime-arn` with the value from `config.json`.
 
 ## Demonstration Flow
 
 ```mermaid
 sequenceDiagram
-    participant Client as MCP Client
-    participant Proxy as mcp-proxy-for-aws
-    participant Server as MCP Server
-    participant Gateway as AgentCore Gateway
-    participant Identity as AgentCore Identity
-    participant GitHub as GitHub API
+    participant User
+    participant MCP as MCP Server
+    participant Cognito
+    participant Google as Google OAuth
+    participant Gateway
+    participant Interceptor as Interceptor Lambda
+    participant Vault as Token Vault
+    participant API as YouTube API
 
-    Note over Client,GitHub: First Request (No OAuth Token)
+    Note over User,API: Step 1: Unauthenticated Access → Inbound Auth
+    User->>MCP: MCP request (no JWT)
+    MCP->>MCP: No valid JWT detected
+    MCP-->>User: Redirect to Cognito Hosted UI
+    User->>Cognito: Sign in with Google
+    Cognito->>Google: OAuth redirect
+    Google-->>Cognito: Auth code + user info
+    Cognito-->>User: Redirect with Cognito JWT
 
-    Client->>Proxy: Call get_user_repos tool
-    Proxy->>Server: MCP tools/call (with SigV4)
-    Note over Proxy: SigV4 signs request with<br/>AWS credentials
-    Server->>Gateway: JSON-RPC call with bearer token
-    Gateway->>Identity: Validate bearer token
-    Identity-->>Gateway: Token valid
-    Gateway->>Identity: Check user's GitHub OAuth token
-    Identity-->>Gateway: No token found
-    Gateway-->>Server: OAuth elicitation response
-    Server-->>Client: Return auth URL
-    Client->>Client: Display auth URL to user
+    Note over User,API: Step 2: First API Call → Outbound Auth (3LO)
+    User->>MCP: MCP request + Cognito JWT
+    MCP->>Gateway: API call + Cognito JWT
+    Gateway->>Gateway: Validate JWT ✓
+    Gateway->>Interceptor: Request + JWT claims
+    Interceptor->>Vault: Get YouTube API token for user X
+    Vault-->>Interceptor: No token found (authorizationUrl)
+    Interceptor-->>Gateway: transformedGatewayResponse (401)
+    Gateway-->>MCP: Return Google auth URL
+    MCP-->>User: Authorization required + auth URL
 
-    Note over Client,GitHub: OAuth Authorization
+    User->>Google: Authorize API scopes (youtube.readonly)
+    Google-->>Vault: Store API token for user X
+    Vault-->>User: Redirect to success page
 
-    Client->>GitHub: User visits auth URL
-    Note over GitHub: User authorizes access
-    GitHub->>Identity: Redirect with auth code
-    Identity->>Server: Redirect to callback URL
-    Note over Identity: Store GitHub token<br/>bound to user (via bearer token)
-
-    Note over Client,GitHub: Second Request (OAuth Authorized)
-
-    Client->>Proxy: Retry get_user_repos tool
-    Proxy->>Server: MCP tools/call (with SigV4)
-    Server->>Gateway: JSON-RPC call with bearer token
-    Gateway->>Identity: Validate bearer token
-    Identity-->>Gateway: Token valid
-    Gateway->>Identity: Get user's GitHub OAuth token
-    Identity-->>Gateway: Return GitHub token
-    Gateway->>GitHub: GET /user/repos (with OAuth)
-    GitHub-->>Gateway: Repository data
-    Gateway-->>Server: JSON response
-    Server-->>Client: Formatted repository list
+    Note over User,API: Step 3: Subsequent Calls → Token Retrieved from Vault
+    User->>MCP: MCP request (tools/call)
+    MCP->>Gateway: API call + Cognito JWT
+    Gateway->>Interceptor: Request + JWT claims
+    Interceptor->>Vault: Get YouTube API token for user X
+    Vault-->>Interceptor: Google API token ✓
+    Interceptor-->>Gateway: transformedGatewayRequest (inject header)
+    Gateway->>API: GET /youtube/v3/channels
+    API-->>Gateway: Channel data
+    Gateway-->>MCP: Response
+    MCP-->>User: Tool result
 ```
 
 ## Construction Flow
@@ -159,236 +130,186 @@ sequenceDiagram
 sequenceDiagram
     participant Dev as Developer
     participant Script as construct.py
-    participant IAM as AWS IAM
-    participant Identity as AgentCore Identity
-    participant Provider as OAuth Provider
-    participant Gateway as AgentCore Gateway
-    participant Target as Gateway Target
+    participant S3 as S3 + CloudFront
+    participant Cognito as Amazon Cognito
+    participant Lambda as AWS Lambda
+    participant AC as AgentCore
 
-    Dev->>Script: Run construct.py
+    Dev->>Script: uv run python construct.py
 
-    Script->>IAM: Create Gateway IAM role
-    IAM-->>Script: gateway_role_arn
+    Note over Script,Lambda: CloudFormation Stack (oauth_gateway_infra.yaml)
+    
+    Note over Script,S3: Step 1: Static Callback Page
+    Script->>S3: Create bucket + distribution
+    Script->>S3: Upload callback_inbound.html, callback_outbound.html
+    S3-->>Script: callback_urls
 
-    Script->>IAM: Create Runtime IAM role
-    IAM-->>Script: runtime_role_arn
+    Note over Script,Cognito: Step 2: Inbound Auth (Cognito + Google)
+    Script->>Cognito: Create User Pool + Google IdP + App Client
+    Cognito-->>Script: client_id, discovery_url
 
-    Script->>Identity: Create workload identity
-    Note right of Script: Registers OAuth callback URL
-    Identity-->>Script: identity_arn
+    Note over Script,Lambda: Step 3: Interceptor Lambda
+    Script->>Lambda: Create function + IAM role
+    Script->>Lambda: Deploy interceptor.py code
+    Lambda-->>Script: interceptor_arn
 
-    Script->>Provider: Create OAuth provider (GitHub)
-    Note right of Script: Stores GitHub client ID/secret
-    Provider-->>Script: provider_arn, callback_url
-
-    Script->>Gateway: Create Gateway
-    Note right of Script: Uses Identity for auth
-    Gateway-->>Script: gateway_id, gateway_url
-
-    Script->>Target: Create Gateway Target
-    Note right of Script: Links OAuth provider<br/>Includes GitHub API spec
-    Target-->>Script: target_id
+    Note over Script,AC: Step 4: AgentCore Resources (boto3)
+    Script->>AC: Create OAuth Provider (Google)
+    AC-->>Script: provider_arn, google_callback_url
+    Script->>Lambda: Set OAUTH_PROVIDER_ARN env var
+    Note right of Lambda: Interceptor needs provider_arn<br/>to call Token Vault API:<br/>get_resource_oauth2_token(<br/>  oauth2CredentialProviderArn=...,<br/>  userIdentifier=...)
+    Script->>AC: Create Gateway (CUSTOM_JWT + Interceptor)
+    AC-->>Script: gateway_id
+    Script->>AC: Create Gateway Target (YouTube API)
+    AC-->>Script: target_id
 
     Script->>Dev: Save config.json
-    Note right of Script: Contains all resource IDs<br/>and callback URLs
+    Script->>Dev: Display callback URLs to register
 ```
 
 ## Specifications
 
-### 1. MCP Server (`mcp_server_with_oauth_gateway/server.py`)
+### Component Responsibilities
 
-**Purpose**: MCP server that exposes tools for GitHub API access via AgentCore Gateway.
+| Component | Responsibility |
+|-----------|---------------|
+| **Cognito** | Federate with Google, issue JWT with user identity |
+| **Gateway (Inbound)** | Validate Cognito JWT, extract user claims |
+| **Interceptor Lambda** | Map user identity → Google API token |
+| **Token Vault** | Store Google API tokens per user |
+| **Gateway (Outbound)** | Call YouTube API with injected token |
 
-**Key Functions:**
-- `call_gateway_tool(tool_name, arguments, context)`: Makes JSON-RPC calls to Gateway
-  - Extracts bearer token from MCP context
-  - Handles OAuth elicitation responses
-  - Returns formatted results
-- `get_user_repos()`: MCP tool to list user's repositories
-- `get_user_profile()`: MCP tool to get user's profile
+### Interceptor Lambda
 
-**Implementation Details:**
-- Uses MCP protocol version `2025-11-25` for OAuth elicitation support
-- Detects OAuth elicitation (error code -32042) and returns authorization URL
-- Parses Gateway responses and formats for MCP clients
-
-### 2. OAuth Callback Handler (`mcp_server_with_oauth_gateway/oauth_callback_handler.py`)
-
-**Purpose**: Web server that handles OAuth callbacks from AgentCore Identity.
-
-**Key Functions:**
-- `_handle_oauth_callback(session_id)`: Processes OAuth callback
-  - Acknowledges successful authorization
-  - Instructs user to retry tool call
-
-**Endpoints:**
-- `GET /`: Home page
-- `GET /oauth/callback?session_id=X`: OAuth callback endpoint
-
-**Note**: In this architecture, the user binding happens automatically via the bearer token (derived from SigV4 credentials). The callback server primarily provides user feedback.
-
-### 3. Infrastructure Construction (`construct.py`)
-
-**Purpose**: Creates all required AWS resources for the example.
-
-**Steps:**
-1. **Create IAM Roles**
-   - Gateway role: Allows bedrock-agentcore.amazonaws.com to invoke targets
-   - Runtime role: Allows bedrock-agentcore.amazonaws.com to run MCP server
-
-2. **Create Workload Identity**
-   - Registers OAuth callback URL
-   - Manages OAuth token storage with user binding
-
-3. **Create OAuth Credential Provider**
-   - Vendor: `GitHubOauth2`
-   - Stores GitHub client ID and secret
-   - Returns callback URL for GitHub OAuth App configuration
-
-4. **Create Gateway**
-   - Protocol: MCP (version 2025-11-25)
-   - Authorizer: Workload Identity
-   - Enables OAuth elicitation
-
-5. **Create Gateway Target**
-   - OpenAPI spec for GitHub API (`/user`, `/user/repos`)
-   - OAuth configuration with scopes: `["repo", "user"]`
-   - Links OAuth credential provider
-
-**Output**: `config.json` with all resource identifiers and URLs
-
-**Cleanup:**
-```bash
-uv run python construct.py --cleanup
+**Input (from Gateway with `passRequestHeaders: true`):**
+```json
+{
+  "interceptorInputVersion": "1.0",
+  "mcp": {
+    "rawGatewayRequest": {
+      "body": "<raw_request_body>"
+    },
+    "gatewayRequest": {
+      "path": "/mcp",
+      "httpMethod": "POST",
+      "headers": {
+        "Authorization": "Bearer <cognito_jwt_token>",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "...", "arguments": {}}
+      }
+    }
+  }
+}
 ```
 
-### 4. Main Entry Point (`main.py`)
+**Logic:**
+1. Extract JWT from `mcp.gatewayRequest.headers.Authorization`
+2. Decode JWT to get claims (including `identities` for federated Google user)
+3. Extract Google user ID from decoded `identities` claim
+4. Call `GetResourceOauth2Token` with user ID
+5. If token exists → inject into `Authorization` header via `transformedGatewayRequest`
+6. If no token → return OAuth elicitation response via `transformedGatewayResponse`
 
-**Purpose**: Starts MCP server or OAuth callback server based on mode.
+**Output (token exists - inject for outbound call):**
+```json
+{
+  "interceptorOutputVersion": "1.0",
+  "mcp": {
+    "transformedGatewayRequest": {
+      "headers": {
+        "Authorization": "Bearer <google_api_token>"
+      },
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "...", "arguments": {}}
+      }
+    }
+  }
+}
+```
 
-**Modes:**
-- `--mode mcp`: Run MCP server (default)
-- `--mode oauth-callback`: Run OAuth callback handler
+**Output (no token - trigger OAuth elicitation):**
+```json
+{
+  "interceptorOutputVersion": "1.0",
+  "mcp": {
+    "transformedGatewayResponse": {
+      "statusCode": 401,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "error": "authorization_required",
+        "authorizationUrl": "<google_oauth_authorization_url>",
+        "message": "User must authorize YouTube API access"
+      }
+    }
+  }
+}
+```
 
-**Configuration:**
-- Loads `config.json`
-- Sets environment variables for server
-- Displays available tools and OAuth flow information
+### Gateway Configuration
+
+```python
+# Inbound: Cognito JWT validation
+authorizerType="CUSTOM_JWT"
+authorizerConfiguration={
+    "customJWTAuthorizer": {
+        "discoveryUrl": cognito_discovery_url,
+        "allowedClients": [cognito_client_id]
+    }
+}
+
+# Interceptor: Bridge identity to token
+interceptorConfigurations=[{
+    "interceptor": {"lambda": {"arn": interceptor_arn}},
+    "interceptionPoints": ["REQUEST"],
+    "inputConfiguration": {"passRequestHeaders": True}
+}]
+```
 
 ## Security Considerations
 
-### Authentication Flow
-- **Client → Proxy**: AWS credentials (SigV4)
-- **Proxy → Server**: SigV4 signed MCP protocol
-- **Server → Gateway**: Bearer token (derived from SigV4)
-- **Gateway → GitHub**: OAuth access token (stored in Identity)
-
-### Token Management
-- **Bearer Token**: Derived from AWS credentials, validated by Workload Identity
-- **GitHub Token**: Stored in AgentCore Identity, bound to bearer token
-- **No Credential Exposure**: Client never sees GitHub credentials
-
-### Production Recommendations
-- **HTTPS Required**: Use HTTPS for callback URLs in production
-- **Token Rotation**: Implement GitHub OAuth token refresh
-- **IAM Policies**: Use least privilege instead of AdministratorAccess
-- **Monitoring**: Log OAuth flows and Gateway requests
-- **Rate Limiting**: Implement request throttling for GitHub API
-
-## Architecture Details
-
-### Why This Architecture?
-
-1. **MCP Server on AgentCore Runtime**
-   - Scalable: AWS manages server infrastructure
-   - Secure: Runs in AWS environment with IAM controls
-   - Integrated: Direct access to AgentCore Gateway
-
-2. **AgentCore Gateway with OAuth**
-   - Token Management: Identity stores and refreshes OAuth tokens
-   - User Binding: Tokens bound to user via bearer token (SigV4)
-   - Elicitation: Returns OAuth URLs when authorization needed
-
-3. **Client via mcp-proxy-for-aws**
-   - Authentication: Uses AWS credentials (SigV4)
-   - Protocol: Standard MCP over AWS infrastructure
-   - Secure: No credential sharing with MCP server
-
-### User Identity Flow
-
-1. Client authenticates with AWS credentials
-2. `mcp-proxy-for-aws` signs requests with SigV4
-3. MCP server receives bearer token (from SigV4)
-4. Gateway validates bearer token with Workload Identity
-5. Identity binds GitHub OAuth token to bearer token
-6. Subsequent requests use same bearer token → same GitHub token
-
-This ensures each AWS user has their own GitHub OAuth token.
+- **Token Isolation**: Each user's Google token stored separately in Token Vault
+- **Identity Binding**: Token retrieval requires matching user ID from JWT
+- **Least Privilege**: Interceptor only has `GetResourceOauth2Token` permission
+- **No Token Exposure**: Google tokens never sent to client
 
 ## Troubleshooting
 
-### Construction Issues
-
-**"ResourceAlreadyExists" error**
-```bash
-uv run python construct.py --cleanup
-```
-
-**"AccessDenied" creating resources**
-- Verify AWS credentials have permissions:
-  - `iam:CreateRole`, `iam:AttachRolePolicy`
-  - `bedrock-agentcore:*`
-
-### OAuth Flow Issues
-
-**"Redirect URI mismatch" from GitHub**
-- Register the `oauth_callback_url` from `config.json` in GitHub OAuth App
-- This is the AgentCore Identity callback URL, different from local callback server
-
-**OAuth callback never completes**
-- Verify callback server is running: `uv run python main.py --mode oauth-callback`
-- Check port 8080 is accessible
-
-### Runtime Issues
-
-**"No bearer token provided"**
-- Ensure `mcp-proxy-for-aws` is configured correctly
-- Verify AWS credentials are available to proxy
-
-**Tools return "error" instead of data**
-- Check Gateway status: `aws bedrock-agentcore get-gateway --gateway-identifier <id>`
-- Verify GitHub OAuth App is configured with correct callback URL
-- Check server logs for detailed error messages
-
-### Debug Commands
-
-**List Gateways:**
-```bash
-aws bedrock-agentcore-control list-gateways --region us-east-1
-```
-
-**Get Gateway Status:**
-```bash
-aws bedrock-agentcore-control get-gateway --gateway-identifier <gateway-id> --region us-east-1
-```
-
-**List Workload Identities:**
-```bash
-aws bedrock-agentcore-control list-workload-identities --region us-east-1
-```
+| Issue | Solution |
+|-------|----------|
+| "JWT validation failed" | Check Cognito discovery URL and client ID match Gateway config |
+| "No Google token found" | User needs to complete 3LO authorization via authorizationUrl |
+| "Interceptor timeout" | Increase Lambda timeout, check VPC/network access to AgentCore |
+| "Invalid redirect_uri" | Ensure callback URLs are registered in both Google OAuth App and Cognito |
+| "Access denied on GetResourceOauth2Token" | Verify Lambda IAM role has `bedrock-agentcore:GetResourceOauth2Token` permission |
 
 ## References
 
 ### AgentCore Documentation
-- [AgentCore Gateway](https://docs.aws.amazon.com/bedrock/latest/userguide/agentcore-gateway.html)
-- [AgentCore Identity](https://docs.aws.amazon.com/bedrock/latest/userguide/agentcore-identity.html)
-- [AgentCore Runtime](https://docs.aws.amazon.com/bedrock/latest/userguide/agentcore-runtime.html)
+- [AgentCore Gateway Overview](https://docs.aws.amazon.com/bedrock/latest/userguide/agentcore-gateway.html)
+- [Gateway Interceptors](https://docs.aws.amazon.com/bedrock/latest/userguide/agentcore-gateway-interceptors.html)
+- [AgentCore Identity - Token Vault](https://docs.aws.amazon.com/bedrock/latest/userguide/agentcore-identity.html)
+- [OAuth 2.0 Credential Providers](https://docs.aws.amazon.com/bedrock/latest/userguide/agentcore-identity-oauth.html)
 
-### External Resources
-- [GitHub OAuth Apps](https://docs.github.com/en/developers/apps/building-oauth-apps)
-- [GitHub REST API](https://docs.github.com/en/rest)
-- [Model Context Protocol](https://modelcontextprotocol.io/)
-- [mcp-proxy-for-aws](https://github.com/aws-samples/mcp-proxy-for-aws)
+### Amazon Cognito
+- [User Pool Federation with Social IdPs](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-identity-federation.html)
+- [Adding Social Identity Providers](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-social-idp.html)
+- [Hosted UI Reference](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-app-integration.html)
 
-### Related Examples
-- [say-hello-to-authorized-customer](../say-hello-to-authorized-customer/): Direct Gateway OAuth with Cognito
+### Google OAuth
+- [Creating OAuth 2.0 Client IDs](https://developers.google.com/identity/protocols/oauth2/web-server#creatingcred)
+- [OAuth 2.0 Scopes for Google APIs](https://developers.google.com/identity/protocols/oauth2/scopes)
+- [YouTube Data API](https://developers.google.com/youtube/v3)
+
+### MCP (Model Context Protocol)
+- [MCP Specification](https://spec.modelcontextprotocol.io/)
+- [MCP Authentication](https://spec.modelcontextprotocol.io/specification/architecture/#authentication)

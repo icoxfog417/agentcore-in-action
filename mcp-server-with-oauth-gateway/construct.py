@@ -1,452 +1,363 @@
-"""Build AgentCore components for MCP Server with OAuth Gateway"""
+#!/usr/bin/env python3
+"""Construct AWS resources for MCP Server with OAuth Gateway.
+
+Uses CloudFormation for infrastructure (S3, CloudFront, Cognito, Lambda, IAM)
+and boto3 for AgentCore resources (no CFN support yet).
+
+Usage:
+    uv run python construct.py          # Create all resources
+    uv run python construct.py --clean  # Delete all resources
+"""
+
 import json
 import os
 import sys
-import time
+import zipfile
+from io import BytesIO
+from pathlib import Path
+
 import boto3
 from dotenv import load_dotenv
 
 load_dotenv()
 
-REGION = os.getenv("AWS_REGION", "us-east-1")
-GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
-GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
-OAUTH_CALLBACK_URL = os.getenv("OAUTH_CALLBACK_URL", "http://localhost:8080/oauth/callback")
-CONFIG_FILE = "config.json"
-
-
-def create_gateway_role(iam_client):
-    """Create IAM role for Gateway"""
-    role_name = f"github-gateway-role-{int(time.time())}"
-
-    trust_policy = {
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
-            "Action": "sts:AssumeRole"
-        }]
-    }
-
-    response = iam_client.create_role(
-        RoleName=role_name,
-        AssumeRolePolicyDocument=json.dumps(trust_policy)
-    )
-
-    # Attach policy for gateway operations
-    iam_client.attach_role_policy(
-        RoleName=role_name,
-        PolicyArn='arn:aws:iam::aws:policy/AdministratorAccess'
-    )
-
-    print(f"✓ Created IAM role: {role_name}")
-    return response["Role"]["Arn"], role_name
-
-
-def create_runtime_role(iam_client):
-    """Create IAM role for AgentCore Runtime (MCP Server)"""
-    role_name = f"github-mcp-runtime-role-{int(time.time())}"
-
-    trust_policy = {
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
-            "Action": "sts:AssumeRole"
-        }]
-    }
-
-    response = iam_client.create_role(
-        RoleName=role_name,
-        AssumeRolePolicyDocument=json.dumps(trust_policy)
-    )
-
-    # Attach policies for runtime operations
-    iam_client.attach_role_policy(
-        RoleName=role_name,
-        PolicyArn='arn:aws:iam::aws:policy/AdministratorAccess'
-    )
-
-    print(f"✓ Created Runtime IAM role: {role_name}")
-    return response["Role"]["Arn"], role_name
-
-
-def create_workload_identity(control_client):
-    """Create Workload Identity for OAuth token storage"""
-    identity_response = control_client.create_workload_identity(
-        name=f"github-workload-identity-{int(time.time())}",
-        allowedResourceOauth2ReturnUrls=[OAUTH_CALLBACK_URL]
-    )
-
-    identity_arn = identity_response["workloadIdentityArn"]
-    identity_name = identity_response["name"]
-    print(f"✓ Created Workload Identity: {identity_name}")
-    return identity_arn, identity_name
-
-
-def create_oauth_provider(control_client):
-    """Create OAuth credential provider for GitHub"""
-    provider_response = control_client.create_oauth2_credential_provider(
-        name=f"github-oauth-provider-{int(time.time())}",
-        credentialProviderVendor="GitHubOauth2",
-        oauth2ProviderConfigInput={
-            "gitHubOauth2ProviderConfig": {
-                "clientId": GITHUB_CLIENT_ID,
-                "clientSecret": GITHUB_CLIENT_SECRET
-            }
-        }
-    )
-
-    provider_arn = provider_response["providerArn"]
-    provider_name = provider_response["name"]
-    callback_url = provider_response["callbackUrl"]
-
-    print(f"✓ Created OAuth Provider: {provider_name}")
-    print(f"⚠ Register this callback URL with GitHub OAuth App:")
-    print(f"  {callback_url}")
-
-    return provider_arn, provider_name, callback_url
-
-
-def create_gateway(control_client, role_arn, identity_arn):
-    """Create Gateway with Identity-based authentication"""
-    gateway_response = control_client.create_gateway(
-        name=f"github-gateway-{int(time.time())}",
-        protocolType="MCP",
-        protocolConfiguration={
-            "mcp": {
-                "supportedVersions": ["2025-11-25"],
-                "searchType": "SEMANTIC"
-            }
-        },
-        authorizerType="WORKLOAD_IDENTITY",
-        authorizerConfiguration={
-            "workloadIdentityAuthorizer": {
-                "workloadIdentityArn": identity_arn
-            }
-        },
-        roleArn=role_arn
-    )
-
-    gateway_id = gateway_response["gatewayId"]
-    gateway_url = gateway_response["gatewayUrl"]
-
-    print(f"✓ Created Gateway: {gateway_id}")
-    print(f"  Gateway URL: {gateway_url}")
-
-    # Wait for gateway to be ready
-    print("Waiting for gateway to be ready...")
-    waiter_count = 0
-    while waiter_count < 30:
-        try:
-            status = control_client.get_gateway(gatewayIdentifier=gateway_id)
-            if status["status"] == "AVAILABLE":
-                print("✓ Gateway is ready")
-                break
-        except Exception as e:
-            pass
-        time.sleep(10)
-        waiter_count += 1
-
-    return gateway_id, gateway_url
-
-
-def create_gateway_target(control_client, gateway_id, provider_arn):
-    """Create Gateway Target with GitHub API spec"""
-    # GitHub API OpenAPI specification
-    github_api_spec = {
-        "openapi": "3.0.0",
-        "info": {
-            "title": "GitHub API",
-            "version": "v3"
-        },
-        "servers": [{
-            "url": "https://api.github.com"
-        }],
-        "paths": {
-            "/user/repos": {
-                "get": {
-                    "operationId": "getUserRepos",
-                    "summary": "List repositories for the authenticated user",
-                    "parameters": [
-                        {
-                            "name": "per_page",
-                            "in": "query",
-                            "schema": {"type": "integer", "default": 30}
-                        },
-                        {
-                            "name": "sort",
-                            "in": "query",
-                            "schema": {"type": "string", "enum": ["created", "updated", "pushed", "full_name"]}
-                        }
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "Successful response",
-                            "content": {
-                                "application/json": {
-                                    "schema": {
-                                        "type": "array",
-                                        "items": {"type": "object"}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/user": {
-                "get": {
-                    "operationId": "getUserProfile",
-                    "summary": "Get the authenticated user",
-                    "responses": {
-                        "200": {
-                            "description": "Successful response",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"type": "object"}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    target_response = control_client.create_gateway_target(
-        gatewayIdentifier=gateway_id,
-        name="GitHubTarget",
-        targetConfiguration={
-            "mcp": {
-                "openApiSchema": {
-                    "inlinePayload": json.dumps(github_api_spec)
-                }
-            }
-        },
-        credentialProviderConfigurations=[{
-            "credentialProviderType": "OAUTH",
-            "credentialProvider": {
-                "oauthCredentialProvider": {
-                    "providerArn": provider_arn,
-                    "grantType": "AUTHORIZATION_CODE",
-                    "defaultReturnUrl": OAUTH_CALLBACK_URL,
-                    "scopes": ["repo", "user"]
-                }
-            }
-        }]
-    )
-
-    target_id = target_response["targetId"]
-    print(f"✓ Created Gateway Target: {target_id}")
-    return target_id
-
-
-def deploy_mcp_server(control_client, runtime_role_arn, gateway_url, gateway_id):
-    """Deploy MCP server to AgentCore Runtime"""
-    # Create runtime configuration
-    runtime_response = control_client.create_runtime(
-        name=f"github-mcp-server-{int(time.time())}",
-        runtimeType="CONTAINER",
-        runtimeConfiguration={
-            "container": {
-                "imageUri": "public.ecr.aws/bedrock-agentcore/mcp-server:latest",  # Placeholder
-                "environment": {
-                    "GATEWAY_URL": gateway_url,
-                    "GATEWAY_ID": gateway_id,
-                    "AWS_REGION": REGION
-                }
-            }
-        },
-        roleArn=runtime_role_arn
-    )
-
-    runtime_id = runtime_response["runtimeId"]
-    runtime_arn = runtime_response["runtimeArn"]
-
-    print(f"✓ Created Runtime: {runtime_id}")
-    print(f"  Runtime ARN: {runtime_arn}")
-
-    return runtime_id, runtime_arn
-
-
-def save_config(config):
-    """Save configuration to JSON file"""
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=2)
-    print(f"✓ Configuration saved to {CONFIG_FILE}")
-
-
-def cleanup_resources():
-    """Delete all created resources"""
-    if not os.path.exists(CONFIG_FILE):
-        print(f"No {CONFIG_FILE} found. Nothing to cleanup.")
-        return
-
-    with open(CONFIG_FILE) as f:
-        config = json.load(f)
-
-    control_client = boto3.client("bedrock-agentcore-control", region_name=REGION)
-    iam_client = boto3.client("iam", region_name=REGION)
-
-    # Delete in reverse order
-    print("Cleaning up resources...")
-
-    # Delete Runtime
-    if "runtime_id" in config:
-        try:
-            control_client.delete_runtime(runtimeIdentifier=config["runtime_id"])
-            print(f"✓ Deleted Runtime: {config['runtime_id']}")
-        except Exception as e:
-            print(f"Failed to delete Runtime: {e}")
-
-    # Delete Gateway Target
-    if "target_id" in config and "gateway_id" in config:
-        try:
-            control_client.delete_gateway_target(
-                gatewayIdentifier=config["gateway_id"],
-                targetIdentifier=config["target_id"]
-            )
-            print(f"✓ Deleted Gateway Target: {config['target_id']}")
-            time.sleep(10)  # Wait for target deletion to propagate
-        except Exception as e:
-            print(f"Failed to delete Gateway Target: {e}")
-
-    # Delete Gateway
-    if "gateway_id" in config:
-        try:
-            control_client.delete_gateway(gatewayIdentifier=config["gateway_id"])
-            print(f"✓ Deleted Gateway: {config['gateway_id']}")
-        except Exception as e:
-            print(f"Failed to delete Gateway: {e}")
-
-    # Delete OAuth Provider
-    if "provider_name" in config:
-        try:
-            control_client.delete_oauth2_credential_provider(name=config["provider_name"])
-            print(f"✓ Deleted OAuth Provider: {config['provider_name']}")
-        except Exception as e:
-            print(f"Failed to delete OAuth Provider: {e}")
-
-    # Delete Workload Identity
-    if "identity_name" in config:
-        try:
-            control_client.delete_workload_identity(name=config["identity_name"])
-            print(f"✓ Deleted Workload Identity: {config['identity_name']}")
-        except Exception as e:
-            print(f"Failed to delete Workload Identity: {e}")
-
-    # Delete IAM roles
-    for role_name in [config.get("gateway_role_name"), config.get("runtime_role_name")]:
-        if role_name:
-            try:
-                # Detach policies first
-                policies = iam_client.list_attached_role_policies(RoleName=role_name)
-                for policy in policies["AttachedPolicies"]:
-                    iam_client.detach_role_policy(
-                        RoleName=role_name,
-                        PolicyArn=policy["PolicyArn"]
-                    )
-                iam_client.delete_role(RoleName=role_name)
-                print(f"✓ Deleted IAM role: {role_name}")
-            except Exception as e:
-                print(f"Failed to delete IAM role {role_name}: {e}")
-
-    # Remove config file
-    os.remove(CONFIG_FILE)
-    print(f"✓ Removed {CONFIG_FILE}")
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+STACK_NAME = "mcp-oauth-gateway"
+CFN_STACK_NAME = f"{STACK_NAME}-infra"
 
 
 def main():
-    """Main construction flow"""
-    import argparse
-    parser = argparse.ArgumentParser(description="Build AgentCore components")
-    parser.add_argument("--cleanup", action="store_true", help="Delete all resources")
-    args = parser.parse_args()
-
-    if args.cleanup:
-        cleanup_resources()
-        return
-
-    # Validate environment
-    if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
-        print("Error: GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET required in .env")
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        print("Error: GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set in .env")
         sys.exit(1)
 
-    print("Building AgentCore components for MCP Server with OAuth Gateway...\n")
+    print(f"Region: {REGION}")
+    print("Starting resource construction...\n")
 
-    iam_client = boto3.client("iam", region_name=REGION)
-    control_client = boto3.client("bedrock-agentcore-control", region_name=REGION)
+    # Step 1-3: Deploy CloudFormation stack (S3, CloudFront, Cognito, Lambda, IAM)
+    print("Step 1-3: Deploying CloudFormation stack...")
+    cfn_outputs = deploy_cfn_stack()
+    print(f"  ✓ Stack deployed: {CFN_STACK_NAME}")
+    for key, value in cfn_outputs.items():
+        print(f"    {key}: {value[:60]}..." if len(value) > 60 else f"    {key}: {value}")
+
+    # Update Lambda code with actual interceptor
+    print("\n  Updating Lambda code...")
+    update_lambda_code(cfn_outputs["InterceptorArn"])
+    print("  ✓ Lambda code updated")
+
+    # Upload callback HTML to S3
+    print("\n  Uploading callback page...")
+    upload_callback_html(cfn_outputs["BucketName"])
+    print("  ✓ Callback page uploaded")
+
+    # Step 4: AgentCore Resources (no CFN support)
+    print("\nStep 4: Creating AgentCore Resources...")
+    config = {"region": REGION, **cfn_outputs}
+
+    # 4a: OAuth Provider
+    print("  4a: Creating OAuth Provider...")
+    provider_config = create_oauth_provider()
+    config.update(provider_config)
+    print(f"    ✓ Provider ARN: {provider_config['provider_arn']}")
+
+    # Update Lambda env with provider ARN
+    update_lambda_env(cfn_outputs["InterceptorArn"], provider_config["provider_arn"])
+
+    # 4b: Gateway
+    print("  4b: Creating Gateway...")
+    gateway_config = create_gateway(cfn_outputs)
+    config.update(gateway_config)
+    print(f"    ✓ Gateway ID: {gateway_config['gateway_id']}")
+
+    # 4c: Gateway Target
+    print("  4c: Creating Gateway Target...")
+    target_config = create_gateway_target(
+        gateway_config["gateway_id"],
+        provider_config["provider_arn"],
+        provider_config["google_callback_url"]
+    )
+    config.update(target_config)
+    print(f"    ✓ Target ID: {target_config['target_id']}")
+
+    # Save config
+    config_path = Path(__file__).parent / "config.json"
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"\n✓ Configuration saved to {config_path}")
+
+    print("\n" + "=" * 60)
+    print("Register this callback URL in Google OAuth App:")
+    print(f"  {config.get('google_callback_url', 'N/A')}")
+    print("=" * 60)
+
+
+def deploy_cfn_stack() -> dict:
+    """Deploy CloudFormation stack and return outputs."""
+    cfn = boto3.client("cloudformation", region_name=REGION)
+    template_path = Path(__file__).parent / "mcp_server_with_oauth_gateway" / "oauth_gateway_infra.yaml"
+
+    with open(template_path) as f:
+        template_body = f.read()
+
+    params = [
+        {"ParameterKey": "StackName", "ParameterValue": STACK_NAME},
+        {"ParameterKey": "GoogleClientId", "ParameterValue": GOOGLE_CLIENT_ID},
+        {"ParameterKey": "GoogleClientSecret", "ParameterValue": GOOGLE_CLIENT_SECRET},
+    ]
 
     try:
-        # Step 1: Create IAM roles
-        print("Step 1: Creating IAM roles...")
-        gateway_role_arn, gateway_role_name = create_gateway_role(iam_client)
-        runtime_role_arn, runtime_role_name = create_runtime_role(iam_client)
-        print()
+        cfn.create_stack(
+            StackName=CFN_STACK_NAME,
+            TemplateBody=template_body,
+            Parameters=params,
+            Capabilities=["CAPABILITY_NAMED_IAM"],
+        )
+        print("  ⏳ Creating stack (this may take a few minutes)...")
+        waiter = cfn.get_waiter("stack_create_complete")
+        waiter.wait(StackName=CFN_STACK_NAME, WaiterConfig={"Delay": 10, "MaxAttempts": 60})
+    except cfn.exceptions.AlreadyExistsException:
+        print("  ⏳ Updating existing stack...")
+        try:
+            cfn.update_stack(
+                StackName=CFN_STACK_NAME,
+                TemplateBody=template_body,
+                Parameters=params,
+                Capabilities=["CAPABILITY_NAMED_IAM"],
+            )
+            waiter = cfn.get_waiter("stack_update_complete")
+            waiter.wait(StackName=CFN_STACK_NAME, WaiterConfig={"Delay": 10, "MaxAttempts": 60})
+        except cfn.exceptions.ClientError as e:
+            if "No updates are to be performed" not in str(e):
+                raise
 
-        # Step 2: Create Workload Identity
-        print("Step 2: Creating Workload Identity...")
-        identity_arn, identity_name = create_workload_identity(control_client)
-        print()
+    # Get outputs
+    response = cfn.describe_stacks(StackName=CFN_STACK_NAME)
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in response["Stacks"][0].get("Outputs", [])}
+    return outputs
 
-        # Step 3: Create OAuth Provider
-        print("Step 3: Creating OAuth Provider...")
-        provider_arn, provider_name, callback_url = create_oauth_provider(control_client)
-        print()
 
-        # Step 4: Create Gateway
-        print("Step 4: Creating Gateway...")
-        gateway_id, gateway_url = create_gateway(control_client, gateway_role_arn, identity_arn)
-        print()
+def update_lambda_code(lambda_arn: str):
+    """Update Lambda with actual interceptor code."""
+    lambda_client = boto3.client("lambda", region_name=REGION)
+    function_name = lambda_arn.split(":")[-1]
 
-        # Step 5: Create Gateway Target
-        print("Step 5: Creating Gateway Target...")
-        target_id = create_gateway_target(control_client, gateway_id, provider_arn)
-        print()
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        interceptor_path = Path(__file__).parent / "mcp_server_with_oauth_gateway" / "interceptor.py"
+        zf.write(interceptor_path, "interceptor.py")
+    zip_buffer.seek(0)
 
-        # Step 6: Deploy MCP Server (Note: This is placeholder - actual deployment varies)
-        print("Step 6: MCP Server deployment...")
-        print("⚠ Note: MCP server deployment to AgentCore Runtime is configured via runtime creation")
-        print("  In production, you would deploy a containerized MCP server")
-        print("  For this example, you'll run the server locally and connect via mcp-proxy-for-aws")
-        runtime_id = "local"  # Placeholder for local development
-        runtime_arn = "local"
-        print()
+    lambda_client.update_function_code(FunctionName=function_name, ZipFile=zip_buffer.read())
+    waiter = lambda_client.get_waiter("function_updated_v2")
+    waiter.wait(FunctionName=function_name)
 
-        # Save configuration
-        config = {
-            "gateway_id": gateway_id,
-            "gateway_url": gateway_url,
-            "gateway_role_arn": gateway_role_arn,
-            "gateway_role_name": gateway_role_name,
-            "runtime_role_arn": runtime_role_arn,
-            "runtime_role_name": runtime_role_name,
-            "identity_arn": identity_arn,
-            "identity_name": identity_name,
-            "provider_arn": provider_arn,
-            "provider_name": provider_name,
-            "target_id": target_id,
-            "runtime_id": runtime_id,
-            "runtime_arn": runtime_arn,
-            "oauth_callback_url": callback_url,
-            "region": REGION
-        }
 
-        save_config(config)
+def update_lambda_env(lambda_arn: str, provider_arn: str):
+    """Update Lambda environment with OAuth provider ARN."""
+    lambda_client = boto3.client("lambda", region_name=REGION)
+    function_name = lambda_arn.split(":")[-1]
+    lambda_client.update_function_configuration(
+        FunctionName=function_name,
+        Environment={"Variables": {"AWS_REGION_NAME": REGION, "OAUTH_PROVIDER_ARN": provider_arn}},
+    )
 
-        print("\n✅ Construction complete!")
-        print("\nNext steps:")
-        print("1. Register the OAuth callback URL with your GitHub OAuth App:")
-        print(f"   {callback_url}")
-        print("2. Run the MCP server: uv run python main.py")
-        print("3. Configure Claude Desktop to connect via mcp-proxy-for-aws")
 
+def upload_callback_html(bucket_name: str):
+    """Upload OAuth callback HTML pages to S3.
+    
+    Two separate pages for different OAuth flows:
+    - callback_inbound.html: Cognito sign-in completion (inbound auth)
+    - callback_outbound.html: YouTube API authorization (outbound auth via Token Vault)
+    """
+    s3 = boto3.client("s3", region_name=REGION)
+    base_path = Path(__file__).parent / "mcp_server_with_oauth_gateway"
+    
+    for filename in ["callback_inbound.html", "callback_outbound.html"]:
+        with open(base_path / filename) as f:
+            html = f.read()
+        s3.put_object(Bucket=bucket_name, Key=filename, Body=html, ContentType="text/html")
+
+
+def create_oauth_provider() -> dict:
+    """Create AgentCore OAuth Provider for Google."""
+    client = boto3.client("bedrock-agentcore-control", region_name=REGION)
+    provider_name = f"{STACK_NAME}-google-provider"
+
+    try:
+        response = client.create_oauth2_credential_provider(
+            name=provider_name,
+            credentialProviderVendor="GoogleOauth2",
+            oauth2ProviderConfigInput={
+                "googleOauth2ProviderConfig": {"clientId": GOOGLE_CLIENT_ID, "clientSecret": GOOGLE_CLIENT_SECRET}
+            },
+        )
+    except client.exceptions.ConflictException:
+        response = client.get_oauth2_credential_provider(name=provider_name)
+
+    return {
+        "provider_arn": response.get("credentialProviderArn", response.get("oauth2CredentialProviderArn", "")),
+        "provider_name": provider_name,
+        "google_callback_url": response.get("callbackUrl", ""),
+    }
+
+
+def create_gateway(cfn_outputs: dict) -> dict:
+    """Create AgentCore Gateway with CUSTOM_JWT auth and interceptor."""
+    client = boto3.client("bedrock-agentcore-control", region_name=REGION)
+    gateway_name = f"{STACK_NAME}-gateway"
+
+    try:
+        response = client.create_gateway(
+            name=gateway_name,
+            roleArn=cfn_outputs["GatewayRoleArn"],
+            protocolType="MCP",
+            protocolConfiguration={
+                "mcp": {
+                    "supportedVersions": ["2025-11-25"],
+                    "searchType": "SEMANTIC"
+                }
+            },
+            authorizerType="CUSTOM_JWT",
+            authorizerConfiguration={
+                "customJWTAuthorizer": {
+                    "discoveryUrl": cfn_outputs["DiscoveryUrl"],
+                    "allowedClients": [cfn_outputs["ClientId"]],
+                }
+            },
+            interceptorConfiguration={"lambdaArn": cfn_outputs["InterceptorArn"], "payloadVersion": "1.0"},
+            exceptionLevel="DEBUG",
+        )
+        gateway_id = response["gatewayId"]
+    except client.exceptions.ConflictException:
+        response = client.get_gateway(gatewayIdentifier=gateway_name)
+        gateway_id = response["gatewayId"]
+
+    return {"gateway_id": gateway_id, "gateway_name": gateway_name}
+
+
+def create_gateway_target(gateway_id: str, provider_arn: str, callback_url: str) -> dict:
+    """Create Gateway Target for YouTube API."""
+    client = boto3.client("bedrock-agentcore-control", region_name=REGION)
+    target_name = f"{STACK_NAME}-youtube-target"
+
+    openapi_spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "YouTube Data API", "version": "v3"},
+        "servers": [{"url": "https://www.googleapis.com/youtube/v3"}],
+        "paths": {
+            "/channels": {
+                "get": {
+                    "operationId": "listChannels",
+                    "parameters": [
+                        {"name": "part", "in": "query", "required": True, "schema": {"type": "string"}},
+                        {"name": "mine", "in": "query", "schema": {"type": "boolean"}},
+                    ],
+                    "responses": {"200": {"description": "Successful response"}},
+                }
+            }
+        },
+    }
+
+    try:
+        response = client.create_gateway_target(
+            gatewayIdentifier=gateway_id,
+            name=target_name,
+            targetConfiguration={
+                "mcp": {
+                    "openApiSchema": {
+                        "inlinePayload": json.dumps(openapi_spec)
+                    }
+                }
+            },
+            credentialProviderConfigurations=[{
+                "credentialProviderType": "OAUTH",
+                "credentialProvider": {
+                    "oauthCredentialProvider": {
+                        "providerArn": provider_arn,
+                        "grantType": "AUTHORIZATION_CODE",
+                        "defaultReturnUrl": callback_url,
+                        "scopes": ["https://www.googleapis.com/auth/youtube.readonly"]
+                    }
+                }
+            }],
+        )
+        target_id = response["targetId"]
+    except client.exceptions.ConflictException:
+        response = client.get_gateway_target(gatewayIdentifier=gateway_id, targetId=target_name)
+        target_id = response["targetId"]
+
+    return {"target_id": target_id, "target_name": target_name}
+
+
+def cleanup():
+    """Delete all resources."""
+    print(f"Region: {REGION}")
+    print("Starting cleanup...\n")
+
+    config_path = Path(__file__).parent / "config.json"
+    config = {}
+    if config_path.exists():
+        with open(config_path) as f:
+            config = json.load(f)
+
+    control_client = boto3.client("bedrock-agentcore-control", region_name=REGION)
+    cfn = boto3.client("cloudformation", region_name=REGION)
+
+    # Step 1: Delete AgentCore resources (reverse order)
+    print("Step 1: Deleting AgentCore resources...")
+    gateway_id = config.get("gateway_id")
+    if gateway_id:
+        try:
+            control_client.delete_gateway_target(gatewayIdentifier=gateway_id, targetId=f"{STACK_NAME}-youtube-target")
+            print("  ✓ Deleted Gateway Target")
+        except Exception as e:
+            print(f"  ⚠ {e}")
+        try:
+            control_client.delete_gateway(gatewayIdentifier=f"{STACK_NAME}-gateway")
+            print("  ✓ Deleted Gateway")
+        except Exception as e:
+            print(f"  ⚠ {e}")
+
+    try:
+        control_client.delete_oauth2_credential_provider(name=f"{STACK_NAME}-google-provider")
+        print("  ✓ Deleted OAuth Provider")
     except Exception as e:
-        print(f"\n❌ Error during construction: {e}")
-        print("Run with --cleanup to remove partial resources")
-        sys.exit(1)
+        print(f"  ⚠ {e}")
+
+    # Step 2: Delete CloudFormation stack (handles all infrastructure)
+    print("\nStep 2: Deleting CloudFormation stack...")
+    try:
+        # Empty S3 bucket first (CFN can't delete non-empty buckets)
+        bucket_name = config.get("BucketName")
+        if bucket_name:
+            s3 = boto3.client("s3", region_name=REGION)
+            try:
+                objects = s3.list_objects_v2(Bucket=bucket_name).get("Contents", [])
+                for obj in objects:
+                    s3.delete_object(Bucket=bucket_name, Key=obj["Key"])
+            except Exception:
+                pass
+
+        cfn.delete_stack(StackName=CFN_STACK_NAME)
+        print("  ⏳ Deleting stack (this may take a few minutes)...")
+        waiter = cfn.get_waiter("stack_delete_complete")
+        waiter.wait(StackName=CFN_STACK_NAME, WaiterConfig={"Delay": 10, "MaxAttempts": 60})
+        print(f"  ✓ Stack deleted: {CFN_STACK_NAME}")
+    except Exception as e:
+        print(f"  ⚠ {e}")
+
+    if config_path.exists():
+        config_path.unlink()
+        print("\n✓ Deleted config.json")
+
+    print("\n✓ Cleanup complete")
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--clean":
+        cleanup()
+    else:
+        main()

@@ -1,48 +1,59 @@
-# Tests for MCP Server with OAuth Gateway
+# Test Suite for MCP Server with OAuth Gateway
 
 ## Overview
+- Total: 9 | Passing: 9 | Failing: 0
 
-This directory contains tests for the MCP Server with OAuth Gateway example.
+## Categories
 
-## Test Structure
+### Configuration
+- test_load_env_config_with_values
+  - Spec: README.md > Quick Start > Environment Setup
+  - Purpose: Verify required env vars are recognized
+  - Status: ✅
 
-### Unit Tests
-- `test_server.py`: Tests for MCP server tool implementations
-- `test_oauth_handler.py`: Tests for OAuth callback handler
-- `test_construct.py`: Tests for infrastructure construction
+- test_env_example_exists
+  - Spec: README.md > Quick Start > Environment Setup
+  - Purpose: Verify .env.example exists with required variables
+  - Status: ✅
 
-### Integration Tests
-- Tests requiring live AWS resources
-- OAuth flow validation
-- Gateway integration tests
+### Interceptor Lambda
+- test_decode_valid_jwt
+  - Spec: README.md > Specifications > Interceptor Lambda > Input
+  - Purpose: Decode JWT payload correctly
+  - Status: ✅
 
-## Running Tests
+- test_decode_invalid_jwt_format
+  - Spec: README.md > Specifications > Interceptor Lambda > Input
+  - Purpose: Reject malformed JWT tokens
+  - Status: ✅
 
+- test_extract_from_identities
+  - Spec: README.md > Specifications > Interceptor Lambda > Logic
+  - Purpose: Extract Google user ID from Cognito identities claim
+  - Status: ✅
+
+- test_no_identities_claim
+  - Spec: README.md > Specifications > Interceptor Lambda > Logic
+  - Purpose: Handle missing identities claim gracefully
+  - Status: ✅
+
+- test_no_google_provider
+  - Spec: README.md > Specifications > Interceptor Lambda > Logic
+  - Purpose: Handle non-Google federated users
+  - Status: ✅
+
+- test_inject_token_response
+  - Spec: README.md > Specifications > Interceptor Lambda > Output (token exists)
+  - Purpose: Return transformedGatewayRequest with injected Authorization header
+  - Status: ✅
+
+- test_auth_required_response
+  - Spec: README.md > Specifications > Interceptor Lambda > Output (no token)
+  - Purpose: Return transformedGatewayResponse with 401 and authorizationUrl
+  - Status: ✅
+
+## Run
 ```bash
-# Install dev dependencies
-uv sync --all-extras
-
-# Run all tests
-uv run pytest
-
-# Run specific test file
-uv run pytest tests/test_server.py
-
-# Run with coverage
-uv run pytest --cov=mcp_server_with_oauth_gateway
+uv run pytest tests/ -v
+uv run pytest tests/ -v --lf
 ```
-
-## Test Requirements
-
-- Mock AWS services for unit tests
-- Live AWS credentials for integration tests (optional)
-- GitHub OAuth App credentials for OAuth tests (optional)
-
-## Mocking Strategy
-
-Unit tests use `moto` to mock AWS services:
-- `bedrock-agentcore-control` for resource creation
-- `bedrock-agentcore` for Identity operations
-- IAM for role management
-
-Integration tests can optionally use real AWS resources if credentials are provided.
