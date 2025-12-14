@@ -2,9 +2,9 @@
 import json
 import os
 from typing import Any
+import requests
 import boto3
 from mcp.server.fastmcp import FastMCP
-from bedrock_agentcore_starter_toolkit.gateway import GatewayClient
 
 # Initialize FastMCP server
 mcp = FastMCP("GitHub MCP Server")
@@ -13,14 +13,6 @@ mcp = FastMCP("GitHub MCP Server")
 GATEWAY_URL = os.getenv("GATEWAY_URL", "")
 GATEWAY_ID = os.getenv("GATEWAY_ID", "")
 REGION = os.getenv("AWS_REGION", "us-east-1")
-
-
-def get_gateway_client() -> GatewayClient:
-    """Get initialized Gateway client"""
-    return GatewayClient(
-        gateway_url=GATEWAY_URL,
-        region=REGION
-    )
 
 
 def call_gateway_tool(tool_name: str, arguments: dict, context: dict) -> dict:
@@ -45,8 +37,6 @@ def call_gateway_tool(tool_name: str, arguments: dict, context: dict) -> dict:
         }
 
     # Make raw JSON-RPC call to Gateway
-    import requests
-
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {bearer_token}",
