@@ -59,15 +59,25 @@ def call_youtube_api(endpoint: str, token: str):
     return resp.json()
 
 
-def store_session(session_id: str, user_id: str):
-    """Store user_id in DynamoDB keyed by session_id."""
+def store_session(session_id: str, user_token: str):
+    """Store KMS-encrypted user_token in DynamoDB keyed by session_id."""
+    # Encrypt token with KMS before storage (security best practice)
+    kms = boto3.client("kms", region_name=REGION)
+    response = kms.encrypt(
+        KeyId=config["kms_key_id"],
+        Plaintext=user_token.encode()  # Convert string to bytes for encryption
+    )
+    
+    # Convert binary ciphertext to base64 string (DynamoDB can't store binary)
+    encrypted_token = base64.b64encode(response["CiphertextBlob"]).decode()
+    
     dynamodb = boto3.resource("dynamodb", region_name=REGION)
     table = dynamodb.Table(OAUTH_SESSION_TABLE)
     table.put_item(Item={
         "session_id": session_id,
-        "user_id": user_id,
+        "encrypted_user_token": encrypted_token,  # Store encrypted, not plain text
         "status": "PENDING",
-        "ttl": int(time.time()) + 600  # 10-minute TTL
+        "ttl": int(time.time()) + 300  # 5-minute TTL (auto-delete for security)
     })
 
 
@@ -118,9 +128,8 @@ def handle_oauth_flow(endpoint: str, token: str) -> bool:
         print("No request_uri found in auth URL")
         return False
     
-    # Store user_id keyed by session_id
-    user_id = get_user_id_from_token(token)
-    store_session(session_id, user_id)
+    # Store token keyed by session_id for CompleteResourceTokenAuth
+    store_session(session_id, token)
     
     print("\n⚠ YouTube authorization required!")
     print("  Opening browser for authorization...")

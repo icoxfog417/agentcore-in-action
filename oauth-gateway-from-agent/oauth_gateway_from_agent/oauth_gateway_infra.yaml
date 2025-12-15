@@ -14,6 +14,29 @@ Parameters:
 
 Resources:
   # =============================================================================
+  # KMS Key for Token Encryption
+  # =============================================================================
+
+  # KMS key for encrypting OAuth tokens at rest
+  TokenEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub '${StackName} OAuth token encryption key'
+      KeyPolicy:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  TokenEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${StackName}-oauth-tokens'
+      TargetKeyId: !Ref TokenEncryptionKey
+
+  # =============================================================================
   # Outbound OAuth Callback Infrastructure (CloudFront -> Lambda -> DynamoDB)
   # Replaces local server for production-ready session binding
   # =============================================================================
@@ -66,6 +89,22 @@ Resources:
                 Action:
                   - bedrock-agentcore:CompleteResourceTokenAuth
                 Resource: '*'
+        - PolicyName: kms-decrypt
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt TokenEncryptionKey.Arn
+        - PolicyName: secrets-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: '*'
 
   # Lambda function for OAuth callback - completes session binding
   CallbackLambda:
@@ -79,16 +118,21 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref OAuthSessionTable
+          KMS_KEY_ID: !Ref TokenEncryptionKey
       Code:
         ZipFile: |
           import os
+          import json
           import boto3
+          import base64
 
           dynamodb = boto3.resource('dynamodb')
           table = dynamodb.Table(os.environ['TABLE_NAME'])
           agentcore = boto3.client('bedrock-agentcore')
+          kms = boto3.client('kms')
 
           def handler(event, context):
+              print(f"Event: {json.dumps(event)}")
               qs = event.get('queryStringParameters') or {}
               session_id = qs.get('session_id')
 
@@ -96,22 +140,32 @@ Resources:
                   return {'statusCode': 400, 'headers': {'Content-Type': 'text/html'},
                           'body': '<h1>Error</h1><p>Missing session_id</p>'}
 
-              # Get user_id from DynamoDB (keyed by session_id)
+              # Get encrypted token from DynamoDB
               resp = table.get_item(Key={'session_id': session_id})
               if 'Item' not in resp:
                   return {'statusCode': 400, 'headers': {'Content-Type': 'text/html'},
-                          'body': f'<h1>Error</h1><p>Unknown session: {session_id[:50]}...</p>'}
+                          'body': '<h1>Error</h1><p>Unknown session</p>'}
 
-              user_id = resp['Item'].get('user_id')
-              if not user_id:
+              encrypted_token = resp['Item'].get('encrypted_user_token')
+              if not encrypted_token:
                   return {'statusCode': 400, 'headers': {'Content-Type': 'text/html'},
-                          'body': '<h1>Error</h1><p>Missing user_id</p>'}
+                          'body': '<h1>Error</h1><p>Missing encrypted token</p>'}
 
-              # Complete session binding with userId
+              # Decrypt token with KMS
+              try:
+                  # Convert base64 string back to binary for decryption
+                  ciphertext = base64.b64decode(encrypted_token)
+                  decrypt_response = kms.decrypt(CiphertextBlob=ciphertext)
+                  user_token = decrypt_response['Plaintext'].decode()
+              except Exception as e:
+                  return {'statusCode': 500, 'headers': {'Content-Type': 'text/html'},
+                          'body': '<h1>Error</h1><p>Token decryption failed</p>'}
+
+              # Complete OAuth with decrypted token
               try:
                   agentcore.complete_resource_token_auth(
                       sessionUri=session_id,
-                      userIdentifier={'userId': user_id}
+                      userIdentifier={'userToken': user_token}
                   )
               except Exception as e:
                   table.update_item(
@@ -123,10 +177,10 @@ Resources:
                   return {'statusCode': 500, 'headers': {'Content-Type': 'text/html'},
                           'body': f'<h1>Error</h1><p>{str(e)}</p>'}
 
-              # Mark as complete
+              # Mark complete and remove encrypted token (cleanup)
               table.update_item(
                   Key={'session_id': session_id},
-                  UpdateExpression='SET #s = :s',
+                  UpdateExpression='SET #s = :s REMOVE encrypted_user_token',
                   ExpressionAttributeNames={'#s': 'status'},
                   ExpressionAttributeValues={':s': 'COMPLETE'}
               )
@@ -285,6 +339,14 @@ Outputs:
     Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration'
   InboundCognitoDomain:
     Value: !Sub '${StackName}-${AWS::AccountId}'
+
+  # KMS Key for Token Encryption
+  KMSKeyId:
+    Value: !Ref TokenEncryptionKey
+    Description: KMS key ID for token encryption (add to config.json)
+  KMSKeyAlias:
+    Value: !Ref TokenEncryptionKeyAlias
+    Description: KMS key alias for token encryption
 
   # Gateway
   GatewayRoleArn:

@@ -80,16 +80,18 @@ def main():
     config.update(target_config)
     print(f"    ✓ Target ID: {target_config['target_id']}")
 
-    # Add callback URLs to config
+    # Add callback URLs and KMS key to config
     cognito_domain = cfn_outputs.get("InboundCognitoDomain", "")
     config["inbound_callback_url"] = f"https://{cognito_domain}.auth.{REGION}.amazoncognito.com/oauth2/idpresponse"
     config["oauth_callback_url"] = callback_url  # CloudFront URL for session binding
+    config["kms_key_id"] = cfn_outputs.get("KMSKeyId", "")  # KMS key for token encryption
 
     # Save config
     config_path = Path(__file__).parent / "config.json"
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
     print(f"\n✓ Configuration saved to {config_path}")
+    print(f"    ✓ KMS Key ID: {config['kms_key_id']}")
 
     print("\n" + "=" * 60)
     print("Register BOTH callback URLs in Google OAuth App:")
@@ -169,7 +171,7 @@ def create_boto3_layer():
         python_dir = Path(tmpdir) / "python"
         python_dir.mkdir()
         subprocess.run(
-            ["pip", "install", "boto3", "-t", str(python_dir), "-q", "--upgrade"],
+            ["uv", "pip", "install", "boto3", "--target", str(python_dir), "-q", "--upgrade"],
             check=True, capture_output=True
         )
 
@@ -261,6 +263,14 @@ def create_gateway(cfn_outputs: dict) -> dict:
     """Create AgentCore Gateway with CUSTOM_JWT auth."""
     client = boto3.client("bedrock-agentcore-control", region_name=REGION)
     gateway_name = f"{STACK_NAME}-gateway"
+    callback_url = cfn_outputs["OAuthCallbackUrl"]
+
+    def ensure_workload_identity(gw_id: str):
+        """Ensure workload identity has callback URL registered."""
+        client.update_workload_identity(
+            name=gw_id,
+            allowedResourceOauth2ReturnUrls=[callback_url]
+        )
 
     # Check if gateway already exists
     existing = client.list_gateways(maxResults=100)
@@ -270,6 +280,7 @@ def create_gateway(cfn_outputs: dict) -> dict:
             gateway_id = gw["gatewayId"]
             if status == "READY":
                 details = client.get_gateway(gatewayIdentifier=gateway_id)
+                ensure_workload_identity(gateway_id)
                 return {"gateway_id": gateway_id, "gateway_name": gateway_name, "gateway_endpoint": details.get("gatewayUrl", "")}
             elif status == "CREATING":
                 print("    ⏳ Waiting for existing gateway to be ready...")
@@ -278,6 +289,7 @@ def create_gateway(cfn_outputs: dict) -> dict:
                     details = client.get_gateway(gatewayIdentifier=gateway_id)
                     status = details.get("status", "")
                 if status == "READY":
+                    ensure_workload_identity(gateway_id)
                     return {"gateway_id": gateway_id, "gateway_name": gateway_name, "gateway_endpoint": details.get("gatewayUrl", "")}
 
     # Create new gateway (no interceptor)
@@ -302,10 +314,13 @@ def create_gateway(cfn_outputs: dict) -> dict:
         details = client.get_gateway(gatewayIdentifier=gateway_id)
         status = details.get("status", "")
         if status == "READY":
-            return {"gateway_id": gateway_id, "gateway_name": gateway_name, "gateway_endpoint": details.get("gatewayUrl", "")}
+            break
         if status == "FAILED":
             raise Exception("Gateway creation failed")
         time.sleep(5)
+
+    ensure_workload_identity(gateway_id)
+    return {"gateway_id": gateway_id, "gateway_name": gateway_name, "gateway_endpoint": details.get("gatewayUrl", "")}
 
 
 def create_gateway_target(gateway_id: str, provider_arn: str, callback_url: str) -> dict:
