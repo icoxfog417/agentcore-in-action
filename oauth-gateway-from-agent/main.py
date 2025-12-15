@@ -3,15 +3,14 @@
 
 Demonstrates:
 - Inbound Auth: User authenticates via Cognito (Google federated)
-- Outbound Auth: Gateway handles YouTube OAuth via local callback server
+- Outbound Auth: Gateway handles YouTube OAuth via CloudFront -> Lambda -> DynamoDB
 """
 
+import base64
 import json
-import threading
+import time
 import webbrowser
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
 
 import boto3
 import requests
@@ -33,29 +32,16 @@ config = load_config()
 REGION = config.get("region", "us-east-1")
 INBOUND_PROVIDER_NAME = config.get("inbound_provider_name", "")
 GATEWAY_ENDPOINT = config.get("gateway_endpoint", "")
-LOCAL_CALLBACK_URL = config.get("local_callback_url", "http://localhost:8765/oauth2/callback")
-CALLBACK_PORT = int(LOCAL_CALLBACK_URL.split(":")[-1].split("/")[0])
+OAUTH_SESSION_TABLE = config.get("OAuthSessionTableName", "")
 
 
-class CallbackHandler(BaseHTTPRequestHandler):
-    """Handle OAuth callback."""
-    session_id = None
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/oauth2/callback":
-            params = parse_qs(parsed.query)
-            CallbackHandler.session_id = params.get("session_id", [None])[0]
-            self.send_response(200)
-            self.send_header("Content-type", "text/html")
-            self.end_headers()
-            self.wfile.write(b"<h1>Authorization complete!</h1><p>You can close this window.</p>")
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, format, *args):
-        pass
+def get_user_id_from_token(token: str) -> str:
+    """Extract user ID (sub claim) from JWT token."""
+    payload = token.split(".")[1]
+    # Add padding if needed
+    payload += "=" * (4 - len(payload) % 4)
+    decoded = json.loads(base64.urlsafe_b64decode(payload))
+    return decoded.get("sub", "")
 
 
 def call_youtube_api(endpoint: str, token: str):
@@ -71,6 +57,46 @@ def call_youtube_api(endpoint: str, token: str):
     if resp.status_code != 200 or not resp.text:
         return {"error": {"code": -1, "message": f"HTTP {resp.status_code}: {resp.text[:200]}"}}
     return resp.json()
+
+
+def store_session(session_id: str, user_token: str):
+    """Store KMS-encrypted user_token in DynamoDB keyed by session_id."""
+    # Encrypt token with KMS before storage (security best practice)
+    kms = boto3.client("kms", region_name=REGION)
+    response = kms.encrypt(
+        KeyId=config["kms_key_id"],
+        Plaintext=user_token.encode()  # Convert string to bytes for encryption
+    )
+    
+    # Convert binary ciphertext to base64 string (DynamoDB can't store binary)
+    encrypted_token = base64.b64encode(response["CiphertextBlob"]).decode()
+    
+    dynamodb = boto3.resource("dynamodb", region_name=REGION)
+    table = dynamodb.Table(OAUTH_SESSION_TABLE)
+    table.put_item(Item={
+        "session_id": session_id,
+        "encrypted_user_token": encrypted_token,  # Store encrypted, not plain text
+        "status": "PENDING",
+        "ttl": int(time.time()) + 300  # 5-minute TTL (auto-delete for security)
+    })
+
+
+def poll_completion(session_id: str, timeout: int = 120) -> str:
+    """Poll DynamoDB for OAuth completion status."""
+    dynamodb = boto3.resource("dynamodb", region_name=REGION)
+    table = dynamodb.Table(OAUTH_SESSION_TABLE)
+    
+    start = time.time()
+    while time.time() - start < timeout:
+        resp = table.get_item(Key={"session_id": session_id})
+        if "Item" in resp:
+            status = resp["Item"].get("status", "PENDING")
+            if status == "COMPLETE":
+                return "COMPLETE"
+            if status == "FAILED":
+                return f"FAILED: {resp['Item'].get('error', 'Unknown error')}"
+        time.sleep(2)
+    return "TIMEOUT"
 
 
 def handle_oauth_flow(endpoint: str, token: str) -> bool:
@@ -91,38 +117,34 @@ def handle_oauth_flow(endpoint: str, token: str) -> bool:
         return False
     
     auth_url = elicitations[0]["url"]
-    print(f"\n⚠ YouTube authorization required!")
-    print(f"  Opening browser for authorization...")
     
-    # Start callback server
-    CallbackHandler.session_id = None
-    server = HTTPServer(("localhost", CALLBACK_PORT), CallbackHandler)
-    server_thread = threading.Thread(target=server.handle_request)
-    server_thread.start()
+    # Extract session_id (request_uri) from auth URL
+    from urllib.parse import urlparse, parse_qs
+    parsed = urlparse(auth_url)
+    query_params = parse_qs(parsed.query)
+    session_id = query_params.get("request_uri", [""])[0]
     
-    # Open browser
-    webbrowser.open(auth_url)
-    
-    # Wait for callback
-    print("  Waiting for authorization...")
-    server_thread.join(timeout=120)
-    server.server_close()
-    
-    session_id = CallbackHandler.session_id
     if not session_id:
-        print("  Timeout waiting for authorization")
+        print("No request_uri found in auth URL")
         return False
     
-    # Complete session binding
-    print("  Completing session binding...")
-    identity_client = boto3.client("bedrock-agentcore", region_name=REGION)
-    identity_client.complete_resource_token_auth(
-        sessionUri=session_id,
-        userIdentifier={"userToken": token}
-    )
+    # Store token keyed by session_id for CompleteResourceTokenAuth
+    store_session(session_id, token)
     
-    print("✓ YouTube API authorized")
-    return True
+    print("\n⚠ YouTube authorization required!")
+    print("  Opening browser for authorization...")
+    webbrowser.open(auth_url)
+    
+    # Poll for completion (Lambda handles complete_resource_token_auth)
+    print("  Waiting for authorization...")
+    status = poll_completion(session_id)
+    
+    if status == "COMPLETE":
+        print("✓ YouTube API authorized")
+        return True
+    else:
+        print(f"  Authorization failed: {status}")
+        return False
 
 
 @requires_access_token(
