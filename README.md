@@ -18,8 +18,8 @@ Bridge the gap between exploration and integration. While Jupyter Notebook examp
 
 | Example | Description | AgentCore Features |
 |---------|-------------|-------------------|
-| [oauth-gateway-from-browser](./oauth-gateway-from-browser/) | Personalized greetings using user's YouTube data via OAuth 2.0 | Identity, Gateway, OAuth 2.0 Authorization Code Grant |
-| [oauth-gateway-from-agent](./oauth-gateway-from-agent/) | MCP server that accesses GitHub API through AgentCore Gateway with OAuth, connected via mcp-proxy-for-aws | Runtime, Gateway, Identity, OAuth 2.0, SigV4 |
+| [oauth-gateway-from-browser](./oauth-gateway-from-browser/) | Personalized greetings using user's YouTube data via OAuth 2.0. Agent greets users with channel names and subscriptions through secure user-delegated API access. | Identity, Gateway, OAuth 2.0 Authorization Code Grant |
+| [oauth-gateway-from-agent](./oauth-gateway-from-agent/) | Secure MCP server with dual OAuth: inbound authentication (user identity via Google/Cognito) and outbound authorization (YouTube API access via Token Vault). Features KMS-encrypted token storage. | Runtime, Gateway, Identity, OAuth 2.0, Token Vault, KMS Encryption |
 
 See each example's README.md for detailed documentation, architecture diagrams, and security considerations.
 
