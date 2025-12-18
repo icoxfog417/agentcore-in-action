@@ -131,11 +131,33 @@ Resources:
           agentcore = boto3.client('bedrock-agentcore')
           kms = boto3.client('kms')
 
+          INBOUND_HTML = '<h1>Sign-in Complete!</h1><p>You can close this window and return to the terminal.</p>'
+          OUTBOUND_HTML = '<h1>YouTube Authorized!</h1><p>You can close this window and return to the terminal.</p>'
+
           def handler(event, context):
               print(f"Event: {json.dumps(event)}")
+              path = event.get('rawPath', '/')
               qs = event.get('queryStringParameters') or {}
               session_id = qs.get('session_id')
 
+              # Inbound auth: use user_id from query param to complete auth
+              if path == '/inbound':
+                  user_id = qs.get('user_id')
+                  if not session_id or not user_id:
+                      return {'statusCode': 400, 'headers': {'Content-Type': 'text/html'},
+                              'body': '<h1>Error</h1><p>Missing session_id or user_id</p>'}
+                  try:
+                      agentcore.complete_resource_token_auth(
+                          sessionUri=session_id,
+                          userIdentifier={'userId': user_id}
+                      )
+                  except Exception as e:
+                      return {'statusCode': 500, 'headers': {'Content-Type': 'text/html'},
+                              'body': f'<h1>Error</h1><p>{str(e)}</p>'}
+                  return {'statusCode': 200, 'headers': {'Content-Type': 'text/html'},
+                          'body': INBOUND_HTML}
+
+              # Outbound auth: require session_id and stored token
               if not session_id:
                   return {'statusCode': 400, 'headers': {'Content-Type': 'text/html'},
                           'body': '<h1>Error</h1><p>Missing session_id</p>'}
@@ -186,7 +208,7 @@ Resources:
               )
 
               return {'statusCode': 200, 'headers': {'Content-Type': 'text/html'},
-                      'body': '<h1>Authorization Complete!</h1><p>You can close this window.</p>'}
+                      'body': OUTBOUND_HTML}
 
   # Lambda Function URL (origin for CloudFront)
   CallbackLambdaUrl:

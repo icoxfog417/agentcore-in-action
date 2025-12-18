@@ -35,13 +35,16 @@ GATEWAY_ENDPOINT = config.get("gateway_endpoint", "")
 OAUTH_SESSION_TABLE = config.get("OAuthSessionTableName", "")
 
 
-def get_user_id_from_token(token: str) -> str:
-    """Extract user ID (sub claim) from JWT token."""
-    payload = token.split(".")[1]
-    # Add padding if needed
-    payload += "=" * (4 - len(payload) % 4)
-    decoded = json.loads(base64.urlsafe_b64decode(payload))
-    return decoded.get("sub", "")
+def get_inbound_callback_url() -> str:
+    """Build inbound callback URL with user_id from .agentcore.json."""
+    base = config.get("oauth_callback_url", "").rstrip("/")
+    config_path = Path(__file__).parent / ".agentcore.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            user_id = json.load(f).get("user_id", "")
+            if user_id:
+                return f"{base}/inbound?user_id={user_id}"
+    return f"{base}/inbound"
 
 
 def call_youtube_api(endpoint: str, token: str):
@@ -126,6 +129,7 @@ def handle_oauth_flow(endpoint: str, token: str) -> bool:
     
     if not session_id:
         print("No request_uri found in auth URL")
+        print(f"[DEBUG] Full auth URL: {auth_url}")
         return False
     
     # Store token keyed by session_id for CompleteResourceTokenAuth
@@ -151,6 +155,7 @@ def handle_oauth_flow(endpoint: str, token: str) -> bool:
     provider_name=INBOUND_PROVIDER_NAME,
     scopes=["openid", "email", "profile"],
     auth_flow="USER_FEDERATION",
+    callback_url=get_inbound_callback_url(),
     on_auth_url=lambda url: (print(f"\nOpen this URL to sign in:\n  {url}\n"), webbrowser.open(url)),
 )
 def run_agent(*, access_token: str):
@@ -182,6 +187,16 @@ if __name__ == "__main__":
     if not INBOUND_PROVIDER_NAME or not GATEWAY_ENDPOINT:
         print("Error: Missing config. Run 'uv run python construct.py' first.")
         exit(1)
+
+    # Check if user_id is available (first run initializes .agentcore.json)
+    if "user_id=" not in get_inbound_callback_url():
+        print("Initializing workload identity...")
+        from bedrock_agentcore.identity.auth import _get_workload_access_token
+        from bedrock_agentcore.services.identity import IdentityClient
+        import asyncio
+        asyncio.run(_get_workload_access_token(IdentityClient(region=REGION)))
+        print("Initialized. Please run again.")
+        exit(0)
 
     print("Starting OAuth Gateway Agent Demo...")
     print(f"  Gateway: {GATEWAY_ENDPOINT}")

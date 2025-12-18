@@ -47,6 +47,7 @@ You are a developer relations advocate introducing practical and straightforward
 * Implement code before defining clear specifications and tests
 * **Assume toolkit abstractions work for all cases**: Use raw boto3 APIs for complex scenarios (e.g., OAuth credential providers)
 * **Skip reference implementation analysis**: When stuck, analyze how reference examples solve the same problem
+* **Modify deployed AWS resources during debugging**: Never update/delete gateway targets, OAuth providers, or other deployed resources for testing. Use `construct.py --clean` and redeploy if resources need changes
 
 ## How We Create (Workflow Summary)
 1. Specification-first
