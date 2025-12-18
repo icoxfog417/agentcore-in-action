@@ -334,6 +334,7 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
                   - bedrock-agentcore:GetWorkloadAccessTokenForJWT
                   - bedrock-agentcore:GetResourceOAuth2Token
                 Resource: '*'
