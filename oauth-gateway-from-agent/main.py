@@ -47,14 +47,14 @@ def get_inbound_callback_url() -> str:
     return f"{base}/inbound"
 
 
-def call_youtube_api(endpoint: str, token: str):
+def call_youtube_api(endpoint: str, token: str, query: str = ""):
     """Call YouTube API via Gateway."""
     resp = requests.post(
         endpoint,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "mcp-protocol-version": "2025-11-25"},
         json={
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "mcp-oauth-gateway-youtube-target___listChannels", "arguments": {"part": "snippet", "mine": True}}
+            "params": {"name": "mcp-oauth-gateway-youtube-target___search", "arguments": {"part": "snippet", "q": query, "maxResults": 5}}
         }
     )
     if resp.status_code != 200 or not resp.text:
@@ -179,7 +179,7 @@ def run_agent(*, access_token: str):
         print(f"✓ Connected to Gateway, {len(tools)} tools available")
 
         agent = Agent(tools=tools)
-        response = agent("List my YouTube channels")
+        response = agent("Search YouTube for 'Generative AI AWS' and return 5 results. Include the video URL for each result.")
         print(response)
 
 

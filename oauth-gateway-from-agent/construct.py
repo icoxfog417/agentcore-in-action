@@ -358,7 +358,19 @@ def create_gateway_target(gateway_id: str, provider_arn: str, callback_url: str)
                     ],
                     "responses": {"200": {"description": "Successful response"}},
                 }
-            }
+            },
+            "/search": {
+                "get": {
+                    "operationId": "search",
+                    "parameters": [
+                        {"name": "part", "in": "query", "required": True, "schema": {"type": "string", "default": "snippet"}},
+                        {"name": "q", "in": "query", "required": True, "schema": {"type": "string"}},
+                        {"name": "maxResults", "in": "query", "schema": {"type": "integer", "default": 7}},
+                        {"name": "order", "in": "query", "schema": {"type": "string", "default": "relevance"}},
+                    ],
+                    "responses": {"200": {"description": "Successful response"}},
+                }
+            },
         },
     }
 
