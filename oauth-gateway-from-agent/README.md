@@ -82,8 +82,11 @@ cp .env.example .env
 # Edit .env with GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET
 uv run python construct.py
 # Register callback URLs in Google OAuth App (shown after construct.py)
-uv run python main.py
+uv run python main.py  # First run: initializes workload identity
+uv run python main.py  # Second run: completes OAuth and runs agent
 ```
+
+**Note:** First run initializes `.agentcore.json` with `user_id` and exits. Second run uses this `user_id` in the callback URL for proper OAuth session binding.
 
 ## Demonstration Flow
 
@@ -240,35 +243,63 @@ Using Google user ID from `identities` claim would create a mismatch - AgentCore
 
 ### OAuth Callback Server (CloudFront + Lambda)
 
-The callback server handles OAuth session binding for outbound authentication. When users authorize YouTube API access, Google redirects to this server to complete the token storage process.
+The callback server handles OAuth session binding for both **inbound** and **outbound** authentication flows.
 
-**Why Not a Static Site?**
-OAuth session binding requires **stateful management** to prevent session hijacking. A static site cannot:
-- Store session data to map `session_id` to user identity  
-- Verify that the OAuth callback matches the original authorization request
-- Call AgentCore APIs to complete secure token binding
+**Two Callback Paths:**
 
-**Security Problem:** Without state tracking, any user could intercept another user's `session_id` from the callback URL and hijack their OAuth session.
+| Path | Purpose | Authentication Method |
+|------|---------|----------------------|
+| `/inbound` | Cognito sign-in completion | `userId` from query param |
+| `/` (root) | YouTube API authorization | `userToken` from DynamoDB |
 
-**Solution:** The callback server stores `(session_id → user_jwt)` in DynamoDB, ensuring only the user who initiated the OAuth flow can complete it.
+**Why Different Methods?**
+
+The `complete_resource_token_auth` API requires a `userIdentifier` to bind the OAuth session to a specific user. This prevents authorization URL forwarding attacks.
+
+| Flow | Challenge | Solution |
+|------|-----------|----------|
+| **Inbound** | `userId` is stable, known before redirect | Pass `userId` in callback URL query param |
+| **Outbound** | `userToken` (JWT) is dynamic, too large for URL | Store encrypted in DynamoDB before redirect |
+
+**Inbound Flow (`/inbound?user_id=xxx&session_id=yyy`):**
+1. `main.py` reads `user_id` from `.agentcore.json` (created by IdentityClient)
+2. Appends `user_id` to callback URL: `/inbound?user_id=xxx`
+3. User completes Cognito/Google sign-in
+4. Lambda receives callback with both `session_id` and `user_id`
+5. Lambda calls `complete_resource_token_auth(sessionUri, userIdentifier={userId: user_id})`
+
+**Outbound Flow (`/?session_id=yyy`):**
+1. `main.py` stores `(session_id → encrypted_user_token)` in DynamoDB before redirect
+2. User completes YouTube authorization
+3. Lambda retrieves and decrypts `user_token` from DynamoDB
+4. Lambda calls `complete_resource_token_auth(sessionUri, userIdentifier={userToken: jwt})`
+
+**First Run Initialization:**
+
+On first run, `.agentcore.json` doesn't exist yet, so `user_id` is unavailable. The script detects this and initializes the workload identity:
+
+```python
+if "user_id=" not in get_inbound_callback_url():
+    print("Initializing workload identity...")
+    # Creates .agentcore.json with workload_identity_name and user_id
+    asyncio.run(_get_workload_access_token(IdentityClient(region=REGION)))
+    print("Initialized. Please run again.")
+    exit(0)
+```
 
 **Architecture:**
 - **CloudFront Distribution**: Public endpoint with DDoS protection and WAF capability
 - **Lambda Function**: Processes OAuth callbacks and completes session binding
-- **DynamoDB Table**: Stores session data with TTL for automatic cleanup
+- **DynamoDB Table**: Stores session data with TTL for automatic cleanup (outbound only)
 - **Origin Access Control (OAC)**: Restricts Lambda access to CloudFront only
 
 **Key Implementation Details:**
 - Lambda requires latest boto3 via Layer (built-in boto3 lacks `bedrock-agentcore` service)
-- Workload identity must register callback URL in `allowedResourceOauth2ReturnUrls`
-- Session binding uses `userToken` (full JWT) not `userId` for authentication
+- Workload identity must register both callback URLs in `allowedResourceOauth2ReturnUrls`:
+  - `https://cloudfront.net/` (outbound)
+  - `https://cloudfront.net/inbound` (inbound)
+- Inbound uses `userId` (stable, 8-char hex), outbound uses `userToken` (full JWT)
 - Lambda needs `secretsmanager:GetSecretValue` permission (required by `CompleteResourceTokenAuth`)
-
-**Session Binding Flow:**
-1. User completes OAuth at Google → redirected to CloudFront URL with `session_id`
-2. Lambda retrieves stored `user_token` from DynamoDB using `session_id`
-3. Lambda calls `CompleteResourceTokenAuth(session_id, userToken=jwt)`
-4. AgentCore stores YouTube token in Token Vault scoped to (Gateway + User)
 
 ### OAuth Providers
 
@@ -464,6 +495,9 @@ credentialProviderConfigurations=[{
 | "JWT validation failed" | Verify Google client ID matches Gateway's allowedAudiences |
 | "No Google token found" | User needs to complete 3LO authorization via authorizationUrl |
 | "Invalid redirect_uri" | Ensure callback URLs are registered in Google OAuth App |
+| "Missing session_id or user_id" | First run initializes `.agentcore.json`. Run `main.py` again |
+| "Unknown session" (outbound) | Session expired (5-min TTL) or not stored. Retry the OAuth flow |
+| Polling never completes | Lambda failed to call `complete_resource_token_auth`. Check CloudWatch logs |
 
 ## References
 

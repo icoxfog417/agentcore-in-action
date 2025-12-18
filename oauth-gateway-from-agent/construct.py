@@ -230,9 +230,25 @@ def create_inbound_cognito_provider(cfn_outputs: dict) -> dict:
     except (client.exceptions.ConflictException, client.exceptions.ValidationException):
         response = client.get_oauth2_credential_provider(name=provider_name)
 
+    # Get AgentCore Identity callback URL (with UUID) for Cognito to redirect to
+    agentcore_callback_url = response.get("callbackUrl", "")
+
+    # Update Cognito client with AgentCore callback URL (for inbound auth flow)
+    cognito.update_user_pool_client(
+        UserPoolId=cfn_outputs["InboundUserPoolId"],
+        ClientId=cfn_outputs["InboundClientId"],
+        CallbackURLs=[agentcore_callback_url],
+        AllowedOAuthFlows=["code"],
+        AllowedOAuthScopes=["openid", "email", "profile"],
+        AllowedOAuthFlowsUserPoolClient=True,
+        SupportedIdentityProviders=["Google", "COGNITO"],
+    )
+    print(f"    ✓ Updated Cognito CallbackURLs with AgentCore callback: {agentcore_callback_url}")
+
     return {
         "inbound_provider_arn": response.get("credentialProviderArn", response.get("oauth2CredentialProviderArn", "")),
         "inbound_provider_name": provider_name,
+        "inbound_provider_callback_url": agentcore_callback_url,
     }
 
 
@@ -269,7 +285,7 @@ def create_gateway(cfn_outputs: dict) -> dict:
         """Ensure workload identity has callback URL registered."""
         client.update_workload_identity(
             name=gw_id,
-            allowedResourceOauth2ReturnUrls=[callback_url]
+            allowedResourceOauth2ReturnUrls=[callback_url, callback_url.rstrip("/") + "/inbound"]
         )
 
     # Check if gateway already exists
